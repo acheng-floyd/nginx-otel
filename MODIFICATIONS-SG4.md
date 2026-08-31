@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -19,7 +19,6 @@ src/http_module.cpp
 tests/test_otel.py
 tests/trace_service.py
 .github/workflows/ubuntu.yml
-.github/workflows/openresty.yml  # new downstream SG4.10 qualification workflow
 tests/test_openresty_sg4.py     # new downstream SG4.10 qualification tests
 .github/dependabot.yml  # removed by generated SG4.5+ tree; SG4.7 preserves the reviewed intermediate management commit only in Git history
 ```
@@ -154,3 +153,7 @@ SG4.9 therefore emits CLIENT/Event `http.response.status_code` only when `status
 `v0.1.2-pr97-sg4.10` does not change the SG4.9 runtime transformation in `src/`. It adds two downstream qualification files: `.github/workflows/openresty.yml` and `tests/test_openresty_sg4.py`. The workflow builds the module with the exact OpenResty 1.31.1.1 source release and verifies that the bundled NGINX 1.31.1 source tree is unchanged by configure/build. The tests cover Lua phase ordering, error_page to a second proxy, HTTPS upstream, and keepalive/reuse.
 
 The multi-proxy/error_page test is a qualification/characterization gate, not a claim that SG4 now has per-proxy-operation span boundaries. That residual remains documented for future design work if real OpenResty CI shows a semantic mismatch.
+
+## SG4.11 OpenResty-primary CI
+
+`v0.1.2-pr97-sg4.11` keeps the SG4 runtime and SG4.10 OpenResty tests unchanged. It replaces the modified upstream `.github/workflows/ubuntu.yml` with a single exact OpenResty 1.31.1.1 build/install/test workflow and removes the separate SG4.10 `.github/workflows/openresty.yml` from the release tree. The workflow installs OpenResty into a workspace-local prefix, exports the matching LuaJIT runtime library directory, verifies the binary reports `openresty/1.31.1.1`, verifies OpenResty/module dynamic libraries resolve, re-checks the bundled NGINX source hash, and requires the complete 45-test suite to execute with zero skips.

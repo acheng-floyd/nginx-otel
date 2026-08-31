@@ -44,7 +44,7 @@ Reference URLs:
 
 ## OpenResty qualification source
 
-SG4.10 CI downloads OpenResty 1.31.1.1 only as a build/test dependency for the
+SG4.10/SG4.11 CI downloads OpenResty 1.31.1.1 only as a build/test dependency for the
 qualification job.  The OpenResty source is not vendored or redistributed in
 this source kit; its own licenses and notices remain applicable to that source
 release.
