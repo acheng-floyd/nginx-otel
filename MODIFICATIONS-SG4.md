@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11/SG4.12/SG4.13/SG4.14/SG4.15/SG4.16 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11/SG4.12/SG4.13/SG4.14/SG4.15/SG4.16/SG4.17 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -153,6 +153,15 @@ The generated repository remains an nginx-otel module fork. It does not vendor o
 
 SG4.9 therefore emits CLIENT/Event `http.response.status_code` only when `status != 0` and `header_time != (ngx_msec_t)-1`. The latter is the public upstream-state evidence that response-header processing completed. This keeps real backend HTTP 4xx/5xx statuses while suppressing synthetic transport-error statuses. No NGINX core source or request/upstream control-flow code is patched.
 
+
+
+## SG4.17 dual-runtime CI hardening
+
+`v0.1.2-pr97-sg4.17` keeps the generated `src/ngx.hpp`, `src/batch_exporter.hpp`, `src/http_module.cpp`, `tests/test_otel.py`, `tests/trace_service.py`, and `tests/test_openresty_sg4.py` behavior inherited from SG4.16. The release changes the generated `.github/workflows/ubuntu.yml` CI policy only.
+
+The workflow now contains independent runtime jobs for vanilla NGINX 1.31.1 and OpenResty 1.31.1.1. Vanilla NGINX must execute exactly 40 `tests/test_otel.py` cases with no skip/failure/error; OpenResty must execute the six dedicated cases and the complete 46-case suite with no skip/failure/error. A final `sg4-dual-runtime-gate` fails unless both jobs report success.
+
+This CI change does not patch NGINX/OpenResty core and does not change SG4 CLIENT-span creation, propagation, attributes, retry Events, error mapping, or request-processing control flow.
 
 ## SG4.10 OpenResty qualification coverage
 

@@ -1,9 +1,10 @@
 # Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
 # See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 # SPDX-License-Identifier: Apache-2.0
-# Downstream SG4.13 primary CI: exact OpenResty 1.31.1.1 build plus trace-isolated
-# qualification and the complete suite; no standalone nginx checkout.
-name: OpenResty 1.31.1.1 build and test
+# Downstream SG4.17 dual-runtime CI: keep the SG4.16 runtime byte-identical and
+# require independent vanilla NGINX 1.31.1 and OpenResty 1.31.1.1 integration
+# gates. The final sg4-dual-runtime-gate succeeds only when both jobs succeed.
+name: SG4 dual runtime build and test
 
 on:
   push:
@@ -14,8 +15,104 @@ on:
 permissions:
   contents: read
 
+env:
+  OTELCOL_VERSION: 0.159.0
+
 jobs:
+  vanilla-nginx-build-test:
+    name: Vanilla NGINX 1.31.1 regression
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake curl jq libc-ares-dev libpcre2-dev \
+            libssl-dev perl pkg-config zlib1g-dev
+
+      - name: Checkout exact NGINX 1.31.1 release commit
+        uses: actions/checkout@v4
+        with:
+          repository: nginx/nginx
+          ref: d44205284fa41662da803b796d6056fc1e59b1f3
+          path: nginx
+          persist-credentials: false
+
+      - name: Build vanilla NGINX 1.31.1
+        working-directory: nginx
+        run: |
+          auto/configure \
+            --with-compat \
+            --with-debug \
+            --with-http_ssl_module \
+            --with-http_v2_module \
+            --with-http_v3_module
+          make -j2
+
+      - name: Verify vanilla NGINX identity and pristine tracked core
+        run: |
+          test "$(git -C nginx rev-parse HEAD)" = "d44205284fa41662da803b796d6056fc1e59b1f3"
+          nginx/objs/nginx -V 2>&1 | tee nginx-version.txt
+          grep -Fq 'nginx/1.31.1' nginx-version.txt
+          git -C nginx diff --exit-code -- .
+
+      - name: Build ngx_otel_module against vanilla NGINX
+        run: |
+          mkdir -p build
+          cd build
+          cmake \
+            -DNGX_OTEL_NGINX_BUILD_DIR="${GITHUB_WORKSPACE}/nginx/objs" \
+            -DNGX_OTEL_DEV=ON \
+            ..
+          make -j2
+          test -f ngx_otel_module.so
+          ldd ngx_otel_module.so | tee module-nginx-ldd.txt
+          ! grep -Fq 'not found' module-nginx-ldd.txt
+          git -C ../nginx diff --exit-code -- .
+
+      - name: Download pinned otelcol
+        run: |
+          BASE=https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}
+          ARCHIVE=otelcol_${OTELCOL_VERSION}_linux_amd64.tar.gz
+          curl -fsSLO "${BASE}/${ARCHIVE}"
+          curl -fsSLo "${ARCHIVE}.sha256" "${BASE}/${ARCHIVE}.sha256"
+          EXPECTED=$(tr -d '[:space:]' < "${ARCHIVE}.sha256")
+          printf '%s  %s\n' "${EXPECTED}" "${ARCHIVE}" | sha256sum -c -
+          tar -xzf "${ARCHIVE}"
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Run all vanilla NGINX regression cases
+        run: |
+          pytest tests/test_otel.py -vv --maxfail=1 \
+            --junitxml=pytest-nginx.xml \
+            --nginx=nginx/objs/nginx \
+            --module=build/ngx_otel_module.so \
+            --otelcol=./otelcol
+
+      - name: Verify exactly forty vanilla NGINX tests executed
+        run: |
+          python3 - <<'PYTEST_NGINX_SUMMARY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse('pytest-nginx.xml').getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+          totals = {
+              key: sum(int(s.attrib.get(key, 0)) for s in suites)
+              for key in ('tests', 'failures', 'errors', 'skipped')
+          }
+          print('Vanilla NGINX pytest totals:', totals)
+          if totals != {'tests': 40, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit('expected exactly 40 vanilla NGINX tests with zero failure/error/skip')
+          PYTEST_NGINX_SUMMARY
+
   openresty-build-test:
+    name: OpenResty 1.31.1.1 regression
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
@@ -90,8 +187,8 @@ jobs:
           ! grep -Fq 'not found' openresty-ldd.txt
           grep -Fq 'libluajit-5.1.so.2' openresty-ldd.txt
 
-          ldd "${OPENRESTY_MODULE}" | tee module-ldd.txt
-          ! grep -Fq 'not found' module-ldd.txt
+          ldd "${OPENRESTY_MODULE}" | tee module-openresty-ldd.txt
+          ! grep -Fq 'not found' module-openresty-ldd.txt
 
       - name: Verify bundled NGINX source tree unchanged
         run: |
@@ -104,12 +201,15 @@ jobs:
           cmp "${GITHUB_WORKSPACE}/openresty-nginx-core.before.sha256" \
               "${GITHUB_WORKSPACE}/openresty-nginx-core.after.sha256"
 
-      - name: Download otelcol
+      - name: Download pinned otelcol
         run: |
-          LATEST=open-telemetry/opentelemetry-collector-releases/releases/latest
-          TAG=$(curl -s https://api.github.com/repos/${LATEST} | jq -r .tag_name)
-          curl -sLo - https://github.com/${LATEST}/download/\
-          otelcol_${TAG:1}_linux_amd64.tar.gz | tar -xzv
+          BASE=https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}
+          ARCHIVE=otelcol_${OTELCOL_VERSION}_linux_amd64.tar.gz
+          curl -fsSLO "${BASE}/${ARCHIVE}"
+          curl -fsSLo "${ARCHIVE}.sha256" "${BASE}/${ARCHIVE}.sha256"
+          EXPECTED=$(tr -d '[:space:]' < "${ARCHIVE}.sha256")
+          printf '%s  %s\n' "${EXPECTED}" "${ARCHIVE}" | sha256sum -c -
+          tar -xzf "${ARCHIVE}"
 
       - name: Install test dependencies
         run: pip install -r tests/requirements.txt
@@ -161,7 +261,27 @@ jobs:
               key: sum(int(s.attrib.get(key, 0)) for s in suites)
               for key in ('tests', 'failures', 'errors', 'skipped')
           }
-          print('pytest totals:', totals)
+          print('OpenResty pytest totals:', totals)
           if totals != {'tests': 46, 'failures': 0, 'errors': 0, 'skipped': 0}:
               raise SystemExit('expected exactly 46 OpenResty tests with zero failure/error/skip')
           PYTEST_SUMMARY
+
+  sg4-dual-runtime-gate:
+    name: SG4 dual runtime gate
+    if: ${{ always() }}
+    needs:
+      - vanilla-nginx-build-test
+      - openresty-build-test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require both runtime jobs to succeed
+        env:
+          VANILLA_NGINX_RESULT: ${{ needs.vanilla-nginx-build-test.result }}
+          OPENRESTY_RESULT: ${{ needs.openresty-build-test.result }}
+        run: |
+          echo "vanilla-nginx-build-test=${VANILLA_NGINX_RESULT}"
+          echo "openresty-build-test=${OPENRESTY_RESULT}"
+          test "${VANILLA_NGINX_RESULT}" = success
+          test "${OPENRESTY_RESULT}" = success
+          echo 'PASS: SG4 vanilla NGINX 1.31.1 and OpenResty 1.31.1.1 gates both succeeded'

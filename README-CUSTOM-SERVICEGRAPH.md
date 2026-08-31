@@ -107,8 +107,14 @@ rights to NGINX/F5 trademarks.
 
 ## Qualification
 
-This is not an official NGINX release. Run the complete repository pytest suite,
-CentOS 7.9 / Rocky 9 / Rocky 10 builders, an ASan/UBSan qualification build where
-practical, and canary traffic before production. Pay special attention to retry,
-connect failure, upstream 4xx/5xx, cache, keepalive, HTTPS upstream, internal
-redirects and OTLP/Tempo volume.
+SG4.17 keeps the SG4.16 runtime instrumentation unchanged and requires two
+independent GitHub Actions jobs: exactly 40/40 `tests/test_otel.py` cases on
+vanilla NGINX 1.31.1, and 6/6 OpenResty-specific plus 46/46 complete-suite
+cases on OpenResty 1.31.1.1. The `sg4-dual-runtime-gate` job fails unless both
+runtime jobs succeed.
+
+This is not an official NGINX release. Also run CentOS 7.9 / Rocky 9 / Rocky 10
+builders, an ASan/UBSan qualification build where practical, and canary traffic
+before production. Pay special attention to retry, connect failure, upstream
+4xx/5xx, cache, keepalive, HTTPS upstream, internal redirects and OTLP/Tempo
+volume.
