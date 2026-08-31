@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# Downstream SG4.12 OpenResty qualification/diagnostic tests.  This is a new downstream
+# Downstream SG4.13 OpenResty trace-isolated qualification/diagnostic tests.  This is a new downstream
 # test file, not an upstream nginx/nginx-otel file.
 import os
+import secrets
 
 import niquests
 import pytest
@@ -52,6 +53,14 @@ http {
     server {
         listen 127.0.0.1:18090;
         server_name localhost;
+
+        # SG4.13 explicit OpenResty no-Lua baseline.  This proves that a normal
+        # proxy_pass path is qualified independently from lua-nginx-module phase
+        # ordering and must retain native HTTP semantics while emitting one CLIENT.
+        location = /sg413-plain-proxy {
+            add_header X-Otel-Upstream-Span-Id $otel_upstream_span_id always;
+            proxy_pass http://127.0.0.1:18091/sg413-plain-backend;
+        }
 
         # rewrite_by_lua performs an internal location jump. access_by_lua must
         # finish before SG4 snapshots the final path and injects the CLIENT id.
@@ -116,6 +125,11 @@ http {
         listen 127.0.0.1:18091;
         server_name sg410-backend;
 
+        location = /sg413-plain-backend {
+            add_header X-SG413-Plain-Backend yes always;
+            return 204;
+        }
+
         location = /sg410-lua-backend {
             add_header X-SG410-Seen-Access $http_x_sg410_access always;
             return 204;
@@ -179,11 +193,45 @@ def assert_basic_parentage(spans, backend_name):
     return frontend, outgoing, backend
 
 
+def new_trace_headers():
+    # A unique non-zero W3C trace id makes every test independent of late OTLP
+    # delivery from earlier cases. The incoming parent span id is deliberately
+    # synthetic; the frontend SERVER span should become its child.
+    zero_trace = b"\x00" * 16
+    zero_span = b"\x00" * 8
+    trace_id = zero_trace
+    parent_id = zero_span
+    while trace_id == zero_trace:
+        trace_id = secrets.token_bytes(16)
+    while parent_id == zero_span:
+        parent_id = secrets.token_bytes(8)
+    traceparent = f"00-{trace_id.hex()}-{parent_id.hex()}-01"
+    return trace_id, {"traceparent": traceparent}
+
+
 @pytest.fixture
 def client(nginx):
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     with niquests.Session(multiplexed=True) as session:
         yield session
+
+
+def test_openresty_plain_proxy_pass_no_lua_is_unaffected(client, trace_service):
+    trace_id, headers = new_trace_headers()
+    r = client.get(
+        "http://127.0.0.1:18090/sg413-plain-proxy",
+        headers=headers,
+        timeout=3,
+    )
+    assert r.status_code == 204
+    assert r.headers["X-SG413-Plain-Backend"] == "yes"
+
+    spans = trace_service.get_spans_for_trace(trace_id, 3)
+    _, outgoing, _ = assert_basic_parentage(spans, "/sg413-plain-backend")
+    assert get_attr(outgoing, "url.path") == "/sg413-plain-proxy"
+    assert get_attr(outgoing, "http.response.status_code") == 204
+    assert r.headers["X-Otel-Upstream-Span-Id"] == outgoing.span_id.hex()
+    assert len(attempt_events(outgoing)) == 1
 
 
 @pytest.mark.parametrize(
@@ -196,23 +244,31 @@ def client(nginx):
     ids=["lua-default-postpone", "lua-no-postpone"],
 )
 def test_openresty_lua_phase_ordering(client, trace_service, testdir, nginx_config):
-    r = client.get("http://127.0.0.1:18090/sg410-lua-entry", timeout=3)
+    trace_id, headers = new_trace_headers()
+    r = client.get(
+        "http://127.0.0.1:18090/sg410-lua-entry",
+        headers=headers,
+        timeout=3,
+    )
     assert r.status_code == 204
     assert r.headers["X-SG410-Seen-Access"] == "yes"
 
-    # SG4.12 first checks the in-request variable exported as a response header.
-    # If this is empty, the failure is PRECONTENT eligibility/ordering rather than
-    # delayed OTLP delivery. Keep this assertion before waiting for the exporter.
+    # Do not fail before collecting the trace. SG4.12 proved the response header
+    # can be empty in the Lua cases; SG4.13 must show whether the matching trace
+    # actually lacks a CLIENT span or whether only variable/header timing differs.
     sid_header = r.headers.get("X-Otel-Upstream-Span-Id", "")
-    print(f"SG412_LUA_DIAGNOSTIC upstream_span_id={sid_header or '<empty>'}")
-    assert sid_header, (
-        "SG4 CLIENT context was not visible in X-Otel-Upstream-Span-Id; "
-        "inspect PRECONTENT ordering/eligibility before changing exporter timing"
+    print(
+        f"SG413_LUA_DIAGNOSTIC trace_id={trace_id.hex()} "
+        f"upstream_span_id={sid_header or '<empty>'}"
     )
 
-    spans = trace_service.get_spans(3)
+    spans = trace_service.get_spans_for_trace(trace_id, 3)
     _, outgoing, _ = assert_basic_parentage(spans, "/sg410-lua-backend")
     assert get_attr(outgoing, "url.path") == "/sg410-lua-final"
+    assert sid_header, (
+        "CLIENT span exists for this trace but X-Otel-Upstream-Span-Id was empty; "
+        "this is a variable/header timing mismatch, not an exporter timing issue"
+    )
     assert sid_header == outgoing.span_id.hex()
 
     log = (testdir / "error.log").read_text()
@@ -221,11 +277,16 @@ def test_openresty_lua_phase_ordering(client, trace_service, testdir, nginx_conf
 
 
 def test_openresty_error_page_second_proxy_preserves_wire_parentage(client, trace_service):
-    r = client.get("http://127.0.0.1:18090/sg410-error-page", timeout=3)
+    trace_id, headers = new_trace_headers()
+    r = client.get(
+        "http://127.0.0.1:18090/sg410-error-page",
+        headers=headers,
+        timeout=3,
+    )
     assert r.status_code == 204
     assert r.headers["X-SG410-Second-Proxy"] == "yes"
 
-    spans = trace_service.get_spans(4)
+    spans = trace_service.get_spans_for_trace(trace_id, 4)
     servers, clients = split_spans(spans)
     assert len(clients) == 1
     assert len(servers) == 3
@@ -252,11 +313,16 @@ def test_openresty_error_page_second_proxy_preserves_wire_parentage(client, trac
 
 
 def test_openresty_https_upstream_parentage(client, trace_service):
-    r = client.get("http://127.0.0.1:18090/sg410-https-proxy", timeout=3)
+    trace_id, headers = new_trace_headers()
+    r = client.get(
+        "http://127.0.0.1:18090/sg410-https-proxy",
+        headers=headers,
+        timeout=3,
+    )
     assert r.status_code == 204
     assert r.headers["X-SG410-HTTPS"] == "yes"
 
-    spans = trace_service.get_spans(3)
+    spans = trace_service.get_spans_for_trace(trace_id, 3)
     _, outgoing, _ = assert_basic_parentage(spans, "/sg410-https-backend")
     assert get_attr(outgoing, "http.response.status_code") == 204
     assert r.headers["X-Otel-Upstream-Span-Id"] == outgoing.span_id.hex()
@@ -264,30 +330,43 @@ def test_openresty_https_upstream_parentage(client, trace_service):
 
 
 def test_openresty_keepalive_reuse_keeps_request_contexts_isolated(client, trace_service):
-    first_response = client.get("http://127.0.0.1:18090/sg410-keepalive-proxy", timeout=3)
-    second_response = client.get("http://127.0.0.1:18090/sg410-keepalive-proxy", timeout=3)
-    assert first_response.status_code == second_response.status_code == 204
-
+    trace_id_1, headers_1 = new_trace_headers()
+    first_response = client.get(
+        "http://127.0.0.1:18090/sg410-keepalive-proxy",
+        headers=headers_1,
+        timeout=3,
+    )
+    assert first_response.status_code == 204
     first_conn = first_response.headers["X-SG410-Upstream-Connection"]
-    second_conn = second_response.headers["X-SG410-Upstream-Connection"]
     assert first_conn
+    first_spans = trace_service.get_spans_for_trace(trace_id_1, 3)
+    _, first_client, _ = assert_basic_parentage(
+        first_spans, "/sg410-keepalive-backend"
+    )
+    assert get_attr(first_client, "http.response.status_code") == 204
+    assert len(attempt_events(first_client)) == 1
+
+    # Keep the same frontend Session alive. Waiting for the first trace does not
+    # close NGINX's upstream keepalive pool, so the second request must still
+    # reuse the same upstream TCP connection while getting a fresh trace/span id.
+    trace_id_2, headers_2 = new_trace_headers()
+    second_response = client.get(
+        "http://127.0.0.1:18090/sg410-keepalive-proxy",
+        headers=headers_2,
+        timeout=3,
+    )
+    assert second_response.status_code == 204
+    second_conn = second_response.headers["X-SG410-Upstream-Connection"]
+    assert second_conn
     assert first_conn == second_conn
+    second_spans = trace_service.get_spans_for_trace(trace_id_2, 3)
+    _, second_client, _ = assert_basic_parentage(
+        second_spans, "/sg410-keepalive-backend"
+    )
+    assert get_attr(second_client, "http.response.status_code") == 204
+    assert len(attempt_events(second_client)) == 1
 
-    spans = trace_service.get_spans(6)
-    traces = {}
-    for span in spans:
-        traces.setdefault(span.trace_id, []).append(span)
-    assert len(traces) == 2
-
-    client_ids = []
-    for trace_spans in traces.values():
-        _, outgoing, _ = assert_basic_parentage(
-            trace_spans, "/sg410-keepalive-backend"
-        )
-        assert get_attr(outgoing, "http.response.status_code") == 204
-        assert len(attempt_events(outgoing)) == 1
-        client_ids.append(outgoing.span_id)
-
-    # Reusing the TCP connection must never reuse the telemetry span identity or
-    # leak a previous request's Event list through the protobuf free pool.
-    assert client_ids[0] != client_ids[1]
+    # Reusing the TCP connection must never reuse telemetry identity or leak a
+    # previous request's Event list through the protobuf free pool.
+    assert trace_id_1 != trace_id_2
+    assert first_client.span_id != second_client.span_id

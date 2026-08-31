@@ -1,7 +1,7 @@
 # Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
 # See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 # SPDX-License-Identifier: Apache-2.0
-# Downstream SG4.12 primary CI: exact OpenResty 1.31.1.1 build plus diagnostic-first
+# Downstream SG4.13 primary CI: exact OpenResty 1.31.1.1 build plus trace-isolated
 # qualification and the complete suite; no standalone nginx checkout.
 name: OpenResty 1.31.1.1 build and test
 
@@ -118,13 +118,13 @@ jobs:
         env:
           NGX_OTEL_OPENRESTY_TESTS: '1'
         run: |
-          pytest tests/test_openresty_sg4.py -vv --maxfail=5 \
+          pytest tests/test_openresty_sg4.py -vv --maxfail=6 \
             --junitxml=pytest-openresty-qualification.xml \
             --nginx="${OPENRESTY_NGINX}" \
             --module="${OPENRESTY_MODULE}" \
             --otelcol=./otelcol
 
-      - name: Verify all five OpenResty-specific cases executed
+      - name: Verify all six OpenResty-specific cases executed
         run: |
           python3 - <<'PYTEST_QUAL_SUMMARY'
           import xml.etree.ElementTree as ET
@@ -136,8 +136,8 @@ jobs:
               for key in ('tests', 'failures', 'errors', 'skipped')
           }
           print('OpenResty qualification totals:', totals)
-          if totals != {'tests': 5, 'failures': 0, 'errors': 0, 'skipped': 0}:
-              raise SystemExit('expected exactly 5 OpenResty-specific tests with zero failure/error/skip')
+          if totals != {'tests': 6, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit('expected exactly 6 OpenResty-specific tests with zero failure/error/skip')
           PYTEST_QUAL_SUMMARY
 
       - name: Run complete suite on installed OpenResty
@@ -162,6 +162,6 @@ jobs:
               for key in ('tests', 'failures', 'errors', 'skipped')
           }
           print('pytest totals:', totals)
-          if totals != {'tests': 45, 'failures': 0, 'errors': 0, 'skipped': 0}:
-              raise SystemExit('expected exactly 45 OpenResty tests with zero failure/error/skip')
+          if totals != {'tests': 46, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit('expected exactly 46 OpenResty tests with zero failure/error/skip')
           PYTEST_SUMMARY

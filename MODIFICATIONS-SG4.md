@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11/SG4.12 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11/SG4.12/SG4.13/SG4.14/SG4.15 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -168,3 +168,7 @@ The multi-proxy/error_page test is a qualification/characterization gate, not a 
 - `.github/workflows/ubuntu.yml`: run the complete five-case OpenResty qualification module first, then the complete 45-test gate.
 
 No OpenResty/NGINX request-processing, upstream, Lua, proxy, retry, TLS or keepalive code is patched.
+
+## SG4.13 OpenResty trace isolation and no-Lua proxy baseline
+
+`v0.1.2-pr97-sg4.13` keeps `src/ngx.hpp`, `src/batch_exporter.hpp`, and `src/http_module.cpp` byte-identical to SG4.12 generated output. It changes only test/CI behavior: unique incoming trace ids per OpenResty request, trace-filtered collection, failure-safe buffer clearing, a dedicated plain `proxy_pass` qualification case, and 6/46 exact JUnit gates.
