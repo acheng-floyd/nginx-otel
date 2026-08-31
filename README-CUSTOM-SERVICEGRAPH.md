@@ -79,12 +79,14 @@ from an earlier request could leak into a later Trace.
 
 ## Correctness guards
 
-The CLIENT context is prepared in the final PRECONTENT slot, after rewrite,
-access, try_files and OpenResty precontent_by_lua ordering. SG4 exports the
-CLIENT only after a real upstream state exists. It skips automatic CLIENT
-instrumentation for subrequests, `proxy_pass_request_headers off`, duplicate W3C
-context headers, or explicit proxy_set_header traceparent/tracestate overrides.
-Instrumentation failures are fail-open for business traffic.
+SG4.16 prepares the CLIENT context at the effective `proxy_pass` content-handler
+entry, after rewrite, access, try_files and OpenResty precontent processing. It
+does not depend on a later PRECONTENT handler being resumed after Lua returns.
+SG4 exports the CLIENT only after a real upstream state exists. It skips
+automatic CLIENT instrumentation for subrequests, `proxy_pass_request_headers
+off`, duplicate W3C context headers, or explicit proxy_set_header
+traceparent/tracestate overrides. Instrumentation failures are fail-open for
+business traffic.
 
 SG4 continues to avoid request-derived `u->resolved->host` for span naming and
 server attributes. It also does not hook peer.data, get/free, set_session or

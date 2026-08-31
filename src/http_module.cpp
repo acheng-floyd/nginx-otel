@@ -18,15 +18,15 @@ struct OtelCtx {
     TraceContext parent;
     TraceContext current;
 
-    // sg4: one logical outgoing HTTP CLIENT context for the final proxy_pass
-    // operation.  It is prepared in PRECONTENT, after rewrite/access phases,
-    // and is exported only when NGINX actually attempted an upstream.
+    // sg4: one logical outgoing HTTP CLIENT context for a real proxy_pass
+    // operation. SG4.16 prepares it at proxy content-handler entry, after all
+    // rewrite/access/precontent processing has finished.
     TraceContext upstream;
     uint64_t upstreamStartNs;
 
-    // sg4: query-free snapshot of r->uri at the final PRECONTENT decision.
-    // The bytes are copied into the request pool so later internal redirects
-    // cannot change which path is attached to this logical CLIENT span.
+    // sg4: query-free snapshot of r->uri at proxy content-handler entry. The
+    // bytes are copied into the request pool so later internal redirects cannot
+    // change which path is attached to this logical CLIENT span.
     ngx_str_t upstreamPath;
     bool upstreamActive;
 };
@@ -61,6 +61,11 @@ struct LocationConf {
 
     // sg4: inherited switch, valid in http/server/location.
     ngx_flag_t upstreamSpan;
+
+    // SG4.16 captures the native content handler only for locations whose
+    // effective handler is proxy_pass. This avoids PRECONTENT phase ordering
+    // dependencies, including OpenResty precontent_by_lua short-circuiting.
+    ngx_http_handler_pt upstreamContentHandler;
 };
 
 char* setExporter(ngx_conf_t* cf, ngx_command_t* cmd, void* conf);
@@ -115,7 +120,7 @@ ngx_command_t gCommands[] = {
 
     // sg4: automatically creates an HTTP CLIENT span only for locations whose
     // final content handler is ngx_http_proxy_module (proxy_pass).  The handler
-    // runs in PRECONTENT; ordinary non-proxy paths do not create a CLIENT span.
+    // runs at proxy content entry; ordinary non-proxy paths are not intercepted.
     { ngx_string("otel_upstream_span"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
@@ -561,54 +566,19 @@ ngx_int_t injectClientContextBestEffort(ngx_http_request_t* r,
     return NGX_OK;
 }
 
-bool postponeCurrentPrecontentHandlerToEnd(ngx_http_request_t* r)
+void prepareUpstreamClientContextBestEffort(ngx_http_request_t* r)
 {
-    // OpenResty lua-nginx-module may move precontent_by_lua to the end of the
-    // PRECONTENT phase on the first request.  A static registration order alone
-    // is therefore insufficient.  Use the same phase-engine-safe pattern and
-    // keep sg4 last before it decides whether the final request is proxy_pass.
-    auto cmcf = (ngx_http_core_main_conf_t*)
-        ngx_http_get_module_main_conf(r, ngx_http_core_module);
-    auto handlers = cmcf->phase_engine.handlers;
-    auto current = &handlers[r->phase_handler];
-    auto last = &handlers[current->next - 1];
-
-    if (current >= last) {
-        return false;
-    }
-
-    ngx_http_phase_handler_t saved = *current;
-    ngx_memmove(current, current + 1,
-        (last - current) * sizeof(ngx_http_phase_handler_t));
-    *last = saved;
-
-    // ngx_http_core_generic_phase() increments phase_handler after we return
-    // NGX_DECLINED.  Decrement here so the handler that moved into this slot is
-    // executed next, and sg4 will be called again at the final PRECONTENT slot.
-    r->phase_handler--;
-    return true;
-}
-
-ngx_int_t onUpstreamPrepare(ngx_http_request_t* r)
-{
-    // Do not make a trace decision until every other PRECONTENT handler has run.
-    // This specifically covers core try_files and OpenResty precontent_by_lua,
-    // including lua-nginx-module's own first-request phase postponement.
-    if (postponeCurrentPrecontentHandlerToEnd(r)) {
-        return NGX_DECLINED;
-    }
-
-    // sg4 intentionally does not instrument NGINX subrequests.  Their lifecycle
-    // and parent request context are different enough that pretending they are a
-    // normal proxy CLIENT span can create broken trees.  The main request and
-    // main-request internal redirects are supported.
+    // SG4.16 runs at proxy content-handler entry, not in PRECONTENT. A normal
+    // OpenResty precontent_by_lua completion can return NGX_OK, which makes the
+    // NGINX generic phase checker jump to the next phase and skip any later
+    // PRECONTENT handlers.
     if (r != r->main) {
-        return NGX_DECLINED;
+        return;
     }
 
     auto ctx = getOtelCtx(r);
     if (ctx == NULL || !ctx->current.sampled) {
-        return NGX_DECLINED;
+        return;
     }
 
     auto lcf = getLocationConf(r);
@@ -624,21 +594,16 @@ ngx_int_t onUpstreamPrepare(ngx_http_request_t* r)
 
     if (!eligible) {
         if (ctx->upstreamActive) {
-            // A PRECONTENT handler may run again after an internal redirect.
-            // Never leave an old CLIENT id active for a new final location.
             ctx->upstreamActive = false;
             restoreServerContextBestEffort(r, ctx);
         }
-        return NGX_DECLINED;
+        return;
     }
 
     if (!ctx->upstream.spanId.IsValid()) {
         ctx->upstream = TraceContext::generate(ctx->current.sampled, ctx->current);
     }
 
-    // Reset the start marker on the final PRECONTENT pass.  The span ends in the
-    // log phase; duration therefore includes the complete proxied operation and
-    // can slightly exceed pure socket-upstream time when streaming to the client.
     ctx->upstreamStartNs = currentUnixNano();
     snapshotClientPathBestEffort(r, ctx);
 
@@ -647,11 +612,27 @@ ngx_int_t onUpstreamPrepare(ngx_http_request_t* r)
         restoreServerContextBestEffort(r, ctx);
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
             "OTel sg4: failed to inject CLIENT traceparent; CLIENT span disabled");
-        return NGX_DECLINED;
+        return;
     }
 
     ctx->upstreamActive = true;
-    return NGX_DECLINED;
+}
+
+ngx_int_t onProxyContent(ngx_http_request_t* r)
+{
+    auto lcf = getLocationConf(r);
+    if (lcf == NULL || lcf->upstreamContentHandler == NULL ||
+        lcf->upstreamContentHandler == onProxyContent)
+    {
+        // This is a configuration-time invariant. Never recurse through our own
+        // wrapper if a future NGINX/module ordering violates that invariant.
+        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
+            "OTel sg4: invalid proxy content-handler wrapper state");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    prepareUpstreamClientContextBestEffort(r);
+    return lcf->upstreamContentHandler(r);
 }
 
 StrView getClientSpanName(ngx_http_request_t* r)
@@ -1031,15 +1012,6 @@ ngx_int_t initModule(ngx_conf_t* cf)
 
     *h = onRequestStart;
 
-    // Register in PRECONTENT.  onUpstreamPrepare() dynamically verifies that it
-    // is the final handler in this phase before instrumenting.  This is required
-    // because OpenResty precontent_by_lua can reorder itself at request time.
-    h = (ngx_http_handler_pt*)ngx_array_push(
-        &cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
-    if (h == NULL) {
-        return NGX_ERROR;
-    }
-    *h = onUpstreamPrepare;
     h = (ngx_http_handler_pt*)ngx_array_push(
         &cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
     if (h == NULL) {
@@ -1377,6 +1349,10 @@ ngx_int_t upstreamSpanIdVar(ngx_http_request_t* r, ngx_http_variable_value_t* v,
     if (ctx == NULL || !ctx->upstreamActive || !upstreamAttempted(r) ||
         !ctx->upstream.spanId.IsValid())
     {
+        // This value can legitimately appear later in the same request at proxy
+        // content entry, so an early PRECONTENT read must never be cached.
+        v->valid = 0;
+        v->no_cacheable = 1;
         v->not_found = 1;
         return NGX_OK;
     }
@@ -1391,7 +1367,7 @@ ngx_int_t upstreamSpanIdVar(ngx_http_request_t* r, ngx_http_variable_value_t* v,
     id->ToLowerBase16({buf, size});
     v->len = size;
     v->valid = 1;
-    v->no_cacheable = 0;
+    v->no_cacheable = 1;
     v->not_found = 0;
     v->data = (u_char*)buf;
     return NGX_OK;
@@ -1428,13 +1404,13 @@ ngx_int_t addVariables(ngx_conf_t* cf)
         { ngx_string("otel_parent_id"), NULL, hexIdVar<SpanId>,
             offsetof(OtelCtx, parent.spanId) },
 
-        { ngx_string("otel_upstream_span_id"), NULL, upstreamSpanIdVar },
+        { ngx_string("otel_upstream_span_id"), NULL, upstreamSpanIdVar, 0, NGX_HTTP_VAR_NOCACHEABLE },
 
         { ngx_string("otel_parent_sampled"), NULL, parentSampledVar }
     };
 
     for (auto& v : vars) {
-        auto var = ngx_http_add_variable(cf, &v.name, 0);
+        auto var = ngx_http_add_variable(cf, &v.name, v.flags);
         if (var == NULL) {
             return NGX_ERROR;
         }
@@ -1456,6 +1432,7 @@ void* createLocationConf(ngx_conf_t* cf)
     conf->traceContext = NGX_CONF_UNSET_UINT;
     conf->spanName = (ngx_http_complex_value_t*)NGX_CONF_UNSET_PTR;
     conf->upstreamSpan = NGX_CONF_UNSET;
+    conf->upstreamContentHandler = NULL;
 
     return conf;
 }
@@ -1469,6 +1446,28 @@ char* mergeLocationConf(ngx_conf_t* cf, void* parent, void* child)
     ngx_conf_merge_uint_value(conf->traceContext, prev->traceContext, 0);
     ngx_conf_merge_ptr_value(conf->spanName, prev->spanName, NULL);
     ngx_conf_merge_value(conf->upstreamSpan, prev->upstreamSpan, 0);
+
+    // SG4.16: capture the effective native content handler after core and
+    // ngx_http_proxy_module have merged this location. This downstream module is
+    // dynamic and is hard-pinned to NGINX 1.31.1; re-audit on core/module-order
+    // changes.
+    if (conf->upstreamSpan) {
+        auto plcf = (ngx_http_proxy_loc_conf_t*)
+            ngx_http_conf_get_module_loc_conf(cf, ngx_http_proxy_module);
+        auto clcf = (ngx_http_core_loc_conf_t*)
+            ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+
+        if (proxyPassConfigured(plcf) && clcf != NULL && clcf->handler != NULL) {
+            if (clcf->handler == onProxyContent) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "OTel sg4: proxy content handler is already wrapped");
+                return (char*)NGX_CONF_ERROR;
+            }
+
+            conf->upstreamContentHandler = clcf->handler;
+            clcf->handler = onProxyContent;
+        }
+    }
 
     if (conf->spanAttrs.elts == NULL) {
         conf->spanAttrs = prev->spanAttrs;

@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11/SG4.12/SG4.13/SG4.14/SG4.15 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11/SG4.12/SG4.13/SG4.14/SG4.15/SG4.16 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -41,6 +41,12 @@ The SG4 runtime implementation:
 - Adds protobuf Event-reuse cleanup to avoid cross-request telemetry residue.
 - Avoids PR #97 peer/session callback wrapping.
 - Hard-pins the audited NGINX/OpenResty ABI target.
+- SG4.16 removes the PRECONTENT phase-engine reordering strategy and wraps only
+  the effective proxy content handler. This keeps CLIENT preparation after Lua
+  precontent execution even when OpenResty returns `NGX_OK` and skips remaining
+  PRECONTENT handlers.
+- SG4.16 marks `$otel_upstream_span_id` `NGX_HTTP_VAR_NOCACHEABLE` so an early
+  Lua read of "not found" can be re-evaluated after the CLIENT context exists.
 
 ## SG4.1 packaging revision
 
