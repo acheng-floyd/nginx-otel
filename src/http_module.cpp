@@ -667,18 +667,27 @@ StrView getClientSpanName(ngx_http_request_t* r)
     return StrView("HTTP upstream", sizeof("HTTP upstream") - 1);
 }
 
+bool upstreamStateHasHttpResponse(const ngx_http_upstream_state_t& state)
+{
+    // NGINX may populate state.status with a synthetic 502/504 in
+    // ngx_http_upstream_next() after a transport failure (for example connect
+    // refused or timeout) even though no HTTP response was received from the
+    // selected peer. header_time stays at the public not-observed sentinel
+    // until an upstream response header is successfully processed.
+    return state.status != 0 && state.header_time != (ngx_msec_t)-1;
+}
+
 ngx_uint_t getFinalUpstreamStatus(ngx_http_request_t* r)
 {
-    // A logical CLIENT operation that retries must describe the final wire
-    // attempt, not an earlier response.  If an earlier peer returned 502 but
-    // the final retry ended in connect timeout/refusal, the logical operation
-    // has no final upstream HTTP status and must not report that earlier 502.
+    // Describe the final wire attempt only. In particular, NGINX's synthetic
+    // transport-error 502/504 must not masquerade as a backend HTTP response.
     if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
         return 0;
     }
 
     auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
-    return states[r->upstream_states->nelts - 1].status;
+    auto& finalState = states[r->upstream_states->nelts - 1];
+    return upstreamStateHasHttpResponse(finalState) ? finalState.status : 0;
 }
 
 void addHttpStatusErrorType(BatchExporter::Span& span, ngx_uint_t status)
@@ -746,9 +755,11 @@ void addUpstreamAttemptEvents(BatchExporter::Span& span, ngx_http_request_t* r,
                     event.add("nginx.upstream.peer", toStrView(*state->peer));
                 }
 
-                // Do not emit http.response.status_code=0: zero means that no
-                // upstream HTTP response status was received for this attempt.
-                if (state->status != 0) {
+                // state.status alone is insufficient: NGINX can synthesize
+                // 502/504 for transport failures before any upstream HTTP
+                // response. Only an attempt with an observed response header
+                // may emit http.response.status_code.
+                if (upstreamStateHasHttpResponse(*state)) {
                     event.add("http.response.status_code",
                         static_cast<int>(state->status));
                 }

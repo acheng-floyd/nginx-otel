@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -138,3 +138,10 @@ The final SG4.7 tree still removes `.github/dependabot.yml` according to the SG4
 `v0.1.2-pr97-sg4.8` keeps the SG4.7 runtime tracing implementation unchanged. It repairs the invalid named-location pytest fixture, adds explicit native-proxy non-interference and module-active tests, and adds a CI gate that fails if tracked NGINX core source files are modified.
 
 The generated repository remains an nginx-otel module fork. It does not vendor or patch NGINX core. CI checks out NGINX 1.31.1 separately and builds the dynamic module against that checkout.
+
+
+## SG4.9 synthetic upstream status correction
+
+`v0.1.2-pr97-sg4.9` changes the SG4 telemetry interpretation only. Real NGINX 1.31.1 CI demonstrated that `ngx_http_upstream_next()` can store NGINX-generated 502/504 values in `ngx_http_upstream_state_t.status` for transport failures before an upstream HTTP response exists.
+
+SG4.9 therefore emits CLIENT/Event `http.response.status_code` only when `status != 0` and `header_time != (ngx_msec_t)-1`. The latter is the public upstream-state evidence that response-header processing completed. This keeps real backend HTTP 4xx/5xx statuses while suppressing synthetic transport-error statuses. No NGINX core source or request/upstream control-flow code is patched.

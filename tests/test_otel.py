@@ -32,6 +32,18 @@ http {
         server 127.0.0.1:18080 backup;
     }
 
+    # Real HTTP 502 first, then successful 204 backup.
+    upstream sg4_retry_http502_backend {
+        server 127.0.0.1:18082 max_fails=0;
+        server 127.0.0.1:18080 backup;
+    }
+
+    # Real HTTP 502 first, then transport failure on the final attempt.
+    upstream sg4_retry_http502_then_dead {
+        server 127.0.0.1:18082 max_fails=0;
+        server 127.0.0.1:18081 backup max_fails=0;
+    }
+
     otel_exporter {
         endpoint {{ endpoint or "127.0.0.1:14317" }};
         interval {{ interval or "1ms" }};
@@ -49,6 +61,8 @@ http {
         listen       127.0.0.1:18443 ssl;
         listen       127.0.0.1:18443 quic;
         listen       127.0.0.1:18080;
+        # sg4 test-only real HTTP 502 listener
+        listen       127.0.0.1:18082;
 
         http2 on;
 
@@ -111,6 +125,7 @@ http {
         # sg4 integration fixtures.  The switch itself is set at http{} scope
         # by the individual tests, matching the intended production config.
         location /sg4-backend {
+            if ($server_port = 18082) { return 502; }
             return 204;
         }
         location /sg4-backend-404 {
@@ -176,6 +191,21 @@ http {
             proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
             proxy_next_upstream_tries 2;
             proxy_pass http://sg4_retry_backend/sg4-backend;
+        }
+        location /sg4-real-502 {
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18082/sg4-backend;
+        }
+        location /sg4-retry-real-502 {
+            proxy_next_upstream error timeout http_502;
+            proxy_next_upstream_tries 2;
+            proxy_pass http://sg4_retry_http502_backend/sg4-backend;
+        }
+        location /sg4-retry-real-502-then-dead {
+            proxy_connect_timeout 100ms;
+            proxy_next_upstream error timeout http_502;
+            proxy_next_upstream_tries 2;
+            proxy_pass http://sg4_retry_http502_then_dead/sg4-backend;
         }
     }
 }
@@ -421,7 +451,9 @@ def test_sg4_retry_events_preserve_one_wire_client_span(client, trace_service):
     assert "127.0.0.1:18081" in get_attr(first, "nginx.upstream.peer")
     assert "127.0.0.1:18080" in get_attr(second, "nginx.upstream.peer")
     assert get_attr(first, "http.response.status_code") is None
+    assert get_attr(first, "nginx.upstream.header_time_ms") is None
     assert get_attr(second, "http.response.status_code") == 204
+    assert get_attr(second, "nginx.upstream.header_time_ms") >= 0
     assert first.time_unix_nano == outgoing.end_time_unix_nano
     assert second.time_unix_nano == outgoing.end_time_unix_nano
 
@@ -453,6 +485,59 @@ def test_sg4_connect_failure_does_not_fabricate_http_status(client, trace_servic
     assert get_attr(outgoing, "nginx.upstream.attempts") == 1
     assert len(outgoing.events) == 1
     assert get_attr(outgoing.events[0], "http.response.status_code") is None
+    assert get_attr(outgoing.events[0], "nginx.upstream.header_time_ms") is None
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_real_upstream_502_is_reported_as_http_status(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-real-502").status_code == 502
+    spans = trace_service.get_spans(3)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") == 502
+    assert get_attr(outgoing, "error.type") == "502"
+    assert outgoing.status.code == trace_pb2.Status.STATUS_CODE_ERROR
+    assert len(outgoing.events) == 1
+    event = outgoing.events[0]
+    assert get_attr(event, "http.response.status_code") == 502
+    assert get_attr(event, "nginx.upstream.header_time_ms") >= 0
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_real_502_then_success_preserves_attempt_statuses(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-retry-real-502").status_code == 204
+    spans = trace_service.get_spans(4)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") == 204
+    assert get_attr(outgoing, "nginx.upstream.attempts") == 2
+    assert len(outgoing.events) == 2
+    first, second = outgoing.events
+    assert get_attr(first, "http.response.status_code") == 502
+    assert get_attr(first, "nginx.upstream.header_time_ms") >= 0
+    assert get_attr(second, "http.response.status_code") == 204
+    assert get_attr(second, "nginx.upstream.header_time_ms") >= 0
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_real_502_then_connect_failure_uses_final_no_response(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-retry-real-502-then-dead").status_code == 502
+    spans = trace_service.get_spans(3)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "error.type") == "nginx.upstream.no_response"
+    assert outgoing.status.code == trace_pb2.Status.STATUS_CODE_ERROR
+    assert get_attr(outgoing, "nginx.upstream.attempts") == 2
+    assert len(outgoing.events) == 2
+    first, second = outgoing.events
+    assert get_attr(first, "http.response.status_code") == 502
+    assert get_attr(first, "nginx.upstream.header_time_ms") >= 0
+    assert get_attr(second, "http.response.status_code") is None
+    assert get_attr(second, "nginx.upstream.header_time_ms") is None
 
 
 @pytest.mark.parametrize(

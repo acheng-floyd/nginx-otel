@@ -34,7 +34,7 @@ outgoing traceparent. SG4 does not manufacture different CLIENT span ids after
 the fact. Instead, each `ngx_http_upstream_state_t` is recorded as a Span Event
 named `nginx.upstream.attempt`.
 
-Per-attempt Event attributes can include peer, real upstream HTTP status,
+Per-attempt Event attributes can include peer, HTTP status only when an upstream response header was actually observed,
 connect/header/response durations, response length and byte counters. Timing
 fields with the NGINX `(ngx_msec_t)-1` not-observed sentinel are omitted. At most
 16 attempt Events are recorded; additional attempts are counted in
@@ -50,7 +50,7 @@ SG4 uses the newer names only; there is no legacy dual-write:
 
 ```text
 http.request.method
-http.response.status_code   # only when final upstream attempt received one
+http.response.status_code   # only when final upstream response header/status was observed
 server.address
 server.port
 url.path
@@ -64,7 +64,7 @@ The custom CLIENT span does not emit `http.method`, `http.status_code`,
 the query. This is a privacy-oriented deviation from full HTTP CLIENT semantic
 convention coverage; path segments can still be sensitive or high-cardinality.
 
-If the final upstream attempt returned 4xx/5xx, SG4 sets ERROR and uses the
+NGINX can synthesize upstream-state 502/504 values for transport errors before an HTTP response. SG4 therefore requires an observed upstream header_time before emitting http.response.status_code. If the final upstream attempt really returned 4xx/5xx, SG4 sets ERROR and uses the
 numeric response code string as `error.type`. If the final attempt produced no
 HTTP response and NGINX ends in 5xx, SG4 omits `http.response.status_code` and sets
 `error.type=nginx.upstream.no_response` rather than fabricating NGINX's downstream
