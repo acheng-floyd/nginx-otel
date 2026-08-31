@@ -1,8 +1,8 @@
 # Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
 # See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 # SPDX-License-Identifier: Apache-2.0
-# Downstream SG4.11 primary CI: build and run the complete suite with the exact
-# audited OpenResty 1.31.1.1 distribution, not a standalone nginx checkout.
+# Downstream SG4.12 primary CI: exact OpenResty 1.31.1.1 build plus diagnostic-first
+# qualification and the complete suite; no standalone nginx checkout.
 name: OpenResty 1.31.1.1 build and test
 
 on:
@@ -114,11 +114,37 @@ jobs:
       - name: Install test dependencies
         run: pip install -r tests/requirements.txt
 
+      - name: Run all OpenResty-specific qualification cases first
+        env:
+          NGX_OTEL_OPENRESTY_TESTS: '1'
+        run: |
+          pytest tests/test_openresty_sg4.py -vv --maxfail=5 \
+            --junitxml=pytest-openresty-qualification.xml \
+            --nginx="${OPENRESTY_NGINX}" \
+            --module="${OPENRESTY_MODULE}" \
+            --otelcol=./otelcol
+
+      - name: Verify all five OpenResty-specific cases executed
+        run: |
+          python3 - <<'PYTEST_QUAL_SUMMARY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse('pytest-openresty-qualification.xml').getroot()
+          suites = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+          totals = {
+              key: sum(int(s.attrib.get(key, 0)) for s in suites)
+              for key in ('tests', 'failures', 'errors', 'skipped')
+          }
+          print('OpenResty qualification totals:', totals)
+          if totals != {'tests': 5, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit('expected exactly 5 OpenResty-specific tests with zero failure/error/skip')
+          PYTEST_QUAL_SUMMARY
+
       - name: Run complete suite on installed OpenResty
         env:
           NGX_OTEL_OPENRESTY_TESTS: '1'
         run: |
-          pytest tests --maxfail=1 \
+          pytest tests -vv \
             --junitxml=pytest-openresty.xml \
             --nginx="${OPENRESTY_NGINX}" \
             --module="${OPENRESTY_MODULE}" \

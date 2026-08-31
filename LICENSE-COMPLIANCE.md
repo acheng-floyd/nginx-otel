@@ -22,7 +22,7 @@ The generated repository also receives:
 - `MODIFICATIONS-SG4.md` -- a prominent summary of downstream modifications.
 - `THIRD_PARTY_NOTICES.md` -- provenance and reference-project licensing notes.
 - `LICENSE-COMPLIANCE.md` -- this redistribution guidance.
-- Per-file modification notices in every retained upstream source/test/CI file changed by SG4/SG4.5/SG4.6/SG4.8/SG4.9. SG4.10 added downstream OpenResty tests/workflow; SG4.11 retains the downstream tests and folds OpenResty build/test into the modified upstream ubuntu workflow with the existing downstream Apache-2.0 notice. The SG4.5 removal of `.github/dependabot.yml` is recorded in `MODIFICATIONS-SG4.md`.
+- Per-file modification notices in every retained upstream source/test/CI file changed by SG4/SG4.5/SG4.6/SG4.8/SG4.9. SG4.10 added downstream OpenResty tests/workflow; SG4.11 retains the downstream tests and folds OpenResty build/test into the modified upstream ubuntu workflow with the existing downstream Apache-2.0 notice; SG4.12 changes only those downstream test/CI diagnostics and does not add third-party runtime code. The SG4.5 removal of `.github/dependabot.yml` is recorded in `MODIFICATIONS-SG4.md`.
 
 These measures are intended to make the Apache-2.0 redistribution obligations
 easy to audit, especially the requirements to keep the license, preserve notices,

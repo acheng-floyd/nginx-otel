@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8/SG4.9/SG4.10/SG4.11/SG4.12 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -157,3 +157,14 @@ The multi-proxy/error_page test is a qualification/characterization gate, not a 
 ## SG4.11 OpenResty-primary CI
 
 `v0.1.2-pr97-sg4.11` keeps the SG4 runtime and SG4.10 OpenResty tests unchanged. It replaces the modified upstream `.github/workflows/ubuntu.yml` with a single exact OpenResty 1.31.1.1 build/install/test workflow and removes the separate SG4.10 `.github/workflows/openresty.yml` from the release tree. The workflow installs OpenResty into a workspace-local prefix, exports the matching LuaJIT runtime library directory, verifies the binary reports `openresty/1.31.1.1`, verifies OpenResty/module dynamic libraries resolve, re-checks the bundled NGINX source hash, and requires the complete 45-test suite to execute with zero skips.
+
+
+## SG4.12 OpenResty asynchronous-span diagnostics
+
+`v0.1.2-pr97-sg4.12` keeps `src/ngx.hpp`, `src/batch_exporter.hpp`, and `src/http_module.cpp` byte-identical to SG4.11 generated output. It changes only test/CI behavior:
+
+- `tests/trace_service.py`: bounded 5-second monotonic wait with immediate success when the exact expected Span count arrives, plus structured timeout diagnostics.
+- `tests/test_openresty_sg4.py`: Lua ordering test first checks `X-Otel-Upstream-Span-Id` so an empty CLIENT context is distinguished from late OTLP export.
+- `.github/workflows/ubuntu.yml`: run the complete five-case OpenResty qualification module first, then the complete 45-test gate.
+
+No OpenResty/NGINX request-processing, upstream, Lua, proxy, retry, TLS or keepalive code is patched.

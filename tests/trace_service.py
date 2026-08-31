@@ -32,16 +32,51 @@ class TraceService(trace_service_pb2_grpc.TraceServiceServicer):
         assert len(batch.scope_spans[0].spans) == 1
         return batch.scope_spans[0].spans.pop()
 
-    def get_spans(self, count):
-        for _ in range(100):
+    def get_spans(self, count, timeout=5.0, poll_interval=0.01):
+        # OTLP export is asynchronous. SG4.11 used an approximately 100 ms
+        # polling window, which was too short on the real OpenResty+Lua CI path.
+        # Use a bounded monotonic deadline and return immediately once the exact
+        # expected batch size is observable; this is not an unconditional sleep.
+        deadline = time.monotonic() + timeout
+        spans = []
+        while True:
             spans = []
-            for resource_batch in self.batches:
+            for resource_batch in list(self.batches):
                 for resource in resource_batch:
                     for scope in resource.scope_spans:
                         spans.extend(scope.spans)
-            if len(spans) >= count:
+            if len(spans) >= count or time.monotonic() >= deadline:
                 break
-            time.sleep(0.001)
+            time.sleep(poll_interval)
+
+        if len(spans) != count:
+            print(
+                f"TRACE_DIAGNOSTIC expected_spans={count} "
+                f"observed_spans={len(spans)} timeout_s={timeout}"
+            )
+            interesting = {
+                "http.response.status_code",
+                "http.request.method",
+                "http.method",
+                "http.status_code",
+                "url.path",
+                "error.type",
+            }
+            for index, span in enumerate(spans):
+                attrs = {}
+                for attr in span.attributes:
+                    if attr.key not in interesting:
+                        continue
+                    which = attr.value.WhichOneof("value")
+                    attrs[attr.key] = getattr(attr.value, which) if which else None
+                print(
+                    "TRACE_DIAGNOSTIC "
+                    f"index={index} name={span.name!r} kind={span.kind} "
+                    f"trace_id={span.trace_id.hex()} span_id={span.span_id.hex()} "
+                    f"parent_span_id={span.parent_span_id.hex()} attrs={attrs!r} "
+                    f"events={[event.name for event in span.events]!r}"
+                )
+
         assert len(spans) == count
         self.batches.clear()
         return spans

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Downstream SG4.10 OpenResty qualification tests.  This is a new downstream
+# Downstream SG4.12 OpenResty qualification/diagnostic tests.  This is a new downstream
 # test file, not an upstream nginx/nginx-otel file.
 import os
 
@@ -11,7 +11,7 @@ from opentelemetry.proto.trace.v1 import trace_pb2
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("NGX_OTEL_OPENRESTY_TESTS") != "1",
-    reason="OpenResty-specific SG4 qualification is disabled in the vanilla NGINX CI job",
+    reason="OpenResty-specific SG4 qualification is disabled outside the exact OpenResty CI run",
 )
 
 
@@ -200,10 +200,20 @@ def test_openresty_lua_phase_ordering(client, trace_service, testdir, nginx_conf
     assert r.status_code == 204
     assert r.headers["X-SG410-Seen-Access"] == "yes"
 
+    # SG4.12 first checks the in-request variable exported as a response header.
+    # If this is empty, the failure is PRECONTENT eligibility/ordering rather than
+    # delayed OTLP delivery. Keep this assertion before waiting for the exporter.
+    sid_header = r.headers.get("X-Otel-Upstream-Span-Id", "")
+    print(f"SG412_LUA_DIAGNOSTIC upstream_span_id={sid_header or '<empty>'}")
+    assert sid_header, (
+        "SG4 CLIENT context was not visible in X-Otel-Upstream-Span-Id; "
+        "inspect PRECONTENT ordering/eligibility before changing exporter timing"
+    )
+
     spans = trace_service.get_spans(3)
     _, outgoing, _ = assert_basic_parentage(spans, "/sg410-lua-backend")
     assert get_attr(outgoing, "url.path") == "/sg410-lua-final"
-    assert r.headers["X-Otel-Upstream-Span-Id"] == outgoing.span_id.hex()
+    assert sid_header == outgoing.span_id.hex()
 
     log = (testdir / "error.log").read_text()
     assert "SG410_PRECONTENT_BEFORE_OTEL uri=/sg410-lua-final" in log
