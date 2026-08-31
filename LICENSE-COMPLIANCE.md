@@ -22,7 +22,7 @@ The generated repository also receives:
 - `MODIFICATIONS-SG4.md` -- a prominent summary of downstream modifications.
 - `THIRD_PARTY_NOTICES.md` -- provenance and reference-project licensing notes.
 - `LICENSE-COMPLIANCE.md` -- this redistribution guidance.
-- Per-file modification notices in every retained upstream source/test/CI file changed by SG4/SG4.5/SG4.6/SG4.8/SG4.9. The SG4.5 removal of `.github/dependabot.yml` is recorded in `MODIFICATIONS-SG4.md`.
+- Per-file modification notices in every retained upstream source/test/CI file changed by SG4/SG4.5/SG4.6/SG4.8/SG4.9. SG4.10 adds new downstream OpenResty test/CI files with SPDX Apache-2.0 headers. The SG4.5 removal of `.github/dependabot.yml` is recorded in `MODIFICATIONS-SG4.md`.
 
 These measures are intended to make the Apache-2.0 redistribution obligations
 easy to audit, especially the requirements to keep the license, preserve notices,
