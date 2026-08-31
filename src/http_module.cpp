@@ -1,3 +1,5 @@
+// Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
+// See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 #include "ngx.hpp"
 
 #include "grpc_log.hpp"
@@ -15,6 +17,18 @@ namespace {
 struct OtelCtx {
     TraceContext parent;
     TraceContext current;
+
+    // sg4: one logical outgoing HTTP CLIENT context for the final proxy_pass
+    // operation.  It is prepared in PRECONTENT, after rewrite/access phases,
+    // and is exported only when NGINX actually attempted an upstream.
+    TraceContext upstream;
+    uint64_t upstreamStartNs;
+
+    // sg4: query-free snapshot of r->uri at the final PRECONTENT decision.
+    // The bytes are copied into the request pool so later internal redirects
+    // cannot change which path is attached to this logical CLIENT span.
+    ngx_str_t upstreamPath;
+    bool upstreamActive;
 };
 
 struct MainConfBase {
@@ -44,6 +58,9 @@ struct LocationConf {
 
     ngx_http_complex_value_t* spanName;
     ngx_array_t spanAttrs;
+
+    // sg4: inherited switch, valid in http/server/location.
+    ngx_flag_t upstreamSpan;
 };
 
 char* setExporter(ngx_conf_t* cf, ngx_command_t* cmd, void* conf);
@@ -95,6 +112,15 @@ ngx_command_t gCommands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(LocationConf, traceContext),
       &Propagation::Types },
+
+    // sg4: automatically creates an HTTP CLIENT span only for locations whose
+    // final content handler is ngx_http_proxy_module (proxy_pass).  The handler
+    // runs in PRECONTENT; ordinary non-proxy paths do not create a CLIENT span.
+    { ngx_string("otel_upstream_span"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(LocationConf, upstreamSpan) },
 
     { ngx_string("otel_span_name"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
@@ -392,6 +418,420 @@ ngx_int_t onRequestStart(ngx_http_request_t* r)
     return rc == NGX_OK ? NGX_DECLINED : rc;
 }
 
+bool proxyHeaderOverridesTraceContext(const ngx_http_proxy_loc_conf_t* plcf)
+{
+    if (plcf == NULL || plcf->headers_source == NULL) {
+        return false;
+    }
+
+    auto headers = (ngx_keyval_t*)plcf->headers_source->elts;
+    for (ngx_uint_t i = 0; i < plcf->headers_source->nelts; ++i) {
+        auto key = headers[i].key;
+        if ((key.len == sizeof("traceparent") - 1 &&
+             ngx_strncasecmp(key.data, (u_char*)"traceparent", key.len) == 0) ||
+            (key.len == sizeof("tracestate") - 1 &&
+             ngx_strncasecmp(key.data, (u_char*)"tracestate", key.len) == 0))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+ngx_uint_t requestHeaderCount(ngx_http_request_t* r, StrView name)
+{
+    auto hash = ngx_hash_key((u_char*)name.data(), name.size());
+    ngx_uint_t count = 0;
+    auto part = &r->headers_in.headers.part;
+    auto elts = (ngx_table_elt_t*)part->elts;
+
+    for (ngx_uint_t i = 0; /* void */; ++i) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            elts = (ngx_table_elt_t*)part->elts;
+            i = 0;
+        }
+
+        if (elts[i].hash == hash && elts[i].key.len == name.size() &&
+            ngx_strncasecmp(elts[i].key.data, (u_char*)name.data(), name.size()) == 0)
+        {
+            ++count;
+        }
+    }
+
+    return count;
+}
+
+bool requestTraceContextIsUnambiguous(ngx_http_request_t* r)
+{
+    // The official module updates the first matching request header.  If a
+    // malformed request contains duplicate W3C context headers, do not create a
+    // CLIENT span whose downstream parent could be parser-dependent.  This is a
+    // fail-closed correctness guard; it does not change official SERVER tracing.
+    return requestHeaderCount(r, "traceparent") <= 1 &&
+           requestHeaderCount(r, "tracestate") <= 1;
+}
+
+bool proxyPassConfigured(const ngx_http_proxy_loc_conf_t* plcf)
+{
+    // This is the same pair of fields ngx_http_proxy_pass() itself uses to
+    // detect whether proxy_pass is configured in the current location.
+    return plcf != NULL &&
+        (plcf->upstream.upstream != NULL || plcf->proxy_lengths != NULL);
+}
+
+bool upstreamAttempted(ngx_http_request_t* r)
+{
+    // Cache HITs return before NGINX creates/pushes an upstream state.  Requiring
+    // at least one state avoids exporting phantom CLIENT spans for cached data,
+    // local responses, rewrites that never proxy, and DNS failures before a peer
+    // attempt is started.
+    return r->upstream != NULL && r->upstream_states != NULL &&
+        r->upstream_states->nelts > 0;
+}
+
+uint64_t currentUnixNano()
+{
+    auto now = ngx_timeofday();
+    return (static_cast<uint64_t>(now->sec) * 1000 + now->msec) * 1000000;
+}
+
+void snapshotClientPathBestEffort(ngx_http_request_t* r, OtelCtx* ctx)
+{
+    // NGINX keeps the current normalized path in r->uri and query arguments
+    // separately in r->args. Copy only r->uri: never r->unparsed_uri or args.
+    // The copy makes the CLIENT attribute stable if a later internal redirect
+    // changes r->uri before LOG. Allocation failure only omits url.path.
+    ctx->upstreamPath.len = 0;
+    ctx->upstreamPath.data = NULL;
+
+    if (r->uri.len == 0 || r->uri.data == NULL) {
+        return;
+    }
+
+    auto data = (u_char*)ngx_pnalloc(r->pool, r->uri.len);
+    if (data == NULL) {
+        return;
+    }
+
+    ngx_memcpy(data, r->uri.data, r->uri.len);
+    ctx->upstreamPath.data = data;
+    ctx->upstreamPath.len = r->uri.len;
+}
+
+void restoreServerContextBestEffort(ngx_http_request_t* r, OtelCtx* ctx)
+{
+    if (ctx == NULL || !ctx->current.spanId.IsValid()) {
+        return;
+    }
+
+    if (inject(r, ctx->current) != NGX_OK) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "OTel sg4: failed to restore SERVER trace context; continuing request");
+    }
+}
+
+ngx_int_t injectClientContextBestEffort(ngx_http_request_t* r,
+    const TraceContext& tc)
+{
+    // Traceparent is required for parentage.  Tracestate is optional.  Unlike
+    // the official request-start path, this additional sg4 instrumentation is
+    // fail-open: telemetry must not turn a healthy proxy request into a 5xx.
+    auto buf = (char*)ngx_pnalloc(r->pool, TraceContext::Size);
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    TraceContext::serialize(tc, buf);
+    auto rc = setHeader(r, "traceparent", {buf, TraceContext::Size});
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    rc = setHeader(r, "tracestate", tc.state);
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "OTel sg4: failed to update tracestate; traceparent remains valid");
+    }
+
+    return NGX_OK;
+}
+
+bool postponeCurrentPrecontentHandlerToEnd(ngx_http_request_t* r)
+{
+    // OpenResty lua-nginx-module may move precontent_by_lua to the end of the
+    // PRECONTENT phase on the first request.  A static registration order alone
+    // is therefore insufficient.  Use the same phase-engine-safe pattern and
+    // keep sg4 last before it decides whether the final request is proxy_pass.
+    auto cmcf = (ngx_http_core_main_conf_t*)
+        ngx_http_get_module_main_conf(r, ngx_http_core_module);
+    auto handlers = cmcf->phase_engine.handlers;
+    auto current = &handlers[r->phase_handler];
+    auto last = &handlers[current->next - 1];
+
+    if (current >= last) {
+        return false;
+    }
+
+    ngx_http_phase_handler_t saved = *current;
+    ngx_memmove(current, current + 1,
+        (last - current) * sizeof(ngx_http_phase_handler_t));
+    *last = saved;
+
+    // ngx_http_core_generic_phase() increments phase_handler after we return
+    // NGX_DECLINED.  Decrement here so the handler that moved into this slot is
+    // executed next, and sg4 will be called again at the final PRECONTENT slot.
+    r->phase_handler--;
+    return true;
+}
+
+ngx_int_t onUpstreamPrepare(ngx_http_request_t* r)
+{
+    // Do not make a trace decision until every other PRECONTENT handler has run.
+    // This specifically covers core try_files and OpenResty precontent_by_lua,
+    // including lua-nginx-module's own first-request phase postponement.
+    if (postponeCurrentPrecontentHandlerToEnd(r)) {
+        return NGX_DECLINED;
+    }
+
+    // sg4 intentionally does not instrument NGINX subrequests.  Their lifecycle
+    // and parent request context are different enough that pretending they are a
+    // normal proxy CLIENT span can create broken trees.  The main request and
+    // main-request internal redirects are supported.
+    if (r != r->main) {
+        return NGX_DECLINED;
+    }
+
+    auto ctx = getOtelCtx(r);
+    if (ctx == NULL || !ctx->current.sampled) {
+        return NGX_DECLINED;
+    }
+
+    auto lcf = getLocationConf(r);
+    auto plcf = (ngx_http_proxy_loc_conf_t*)
+        ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
+
+    bool eligible = lcf->upstreamSpan &&
+        (lcf->traceContext & Propagation::Inject) &&
+        proxyPassConfigured(plcf) &&
+        plcf->upstream.pass_request_headers &&
+        requestTraceContextIsUnambiguous(r) &&
+        !proxyHeaderOverridesTraceContext(plcf);
+
+    if (!eligible) {
+        if (ctx->upstreamActive) {
+            // A PRECONTENT handler may run again after an internal redirect.
+            // Never leave an old CLIENT id active for a new final location.
+            ctx->upstreamActive = false;
+            restoreServerContextBestEffort(r, ctx);
+        }
+        return NGX_DECLINED;
+    }
+
+    if (!ctx->upstream.spanId.IsValid()) {
+        ctx->upstream = TraceContext::generate(ctx->current.sampled, ctx->current);
+    }
+
+    // Reset the start marker on the final PRECONTENT pass.  The span ends in the
+    // log phase; duration therefore includes the complete proxied operation and
+    // can slightly exceed pure socket-upstream time when streaming to the client.
+    ctx->upstreamStartNs = currentUnixNano();
+    snapshotClientPathBestEffort(r, ctx);
+
+    if (injectClientContextBestEffort(r, ctx->upstream) != NGX_OK) {
+        ctx->upstreamActive = false;
+        restoreServerContextBestEffort(r, ctx);
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "OTel sg4: failed to inject CLIENT traceparent; CLIENT span disabled");
+        return NGX_DECLINED;
+    }
+
+    ctx->upstreamActive = true;
+    return NGX_DECLINED;
+}
+
+StrView getClientSpanName(ngx_http_request_t* r)
+{
+    auto u = r->upstream;
+    if (u != NULL && u->upstream != NULL && u->upstream->host.len) {
+        // Named/static upstreams are configuration-owned and bounded.  Do not
+        // use a dynamically resolved request host here: a variable proxy_pass can
+        // derive it from request input and turn the span name into high
+        // cardinality telemetry.
+        return toStrView(u->upstream->host);
+    }
+    return StrView("HTTP upstream", sizeof("HTTP upstream") - 1);
+}
+
+ngx_uint_t getFinalUpstreamStatus(ngx_http_request_t* r)
+{
+    // A logical CLIENT operation that retries must describe the final wire
+    // attempt, not an earlier response.  If an earlier peer returned 502 but
+    // the final retry ended in connect timeout/refusal, the logical operation
+    // has no final upstream HTTP status and must not report that earlier 502.
+    if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
+        return 0;
+    }
+
+    auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
+    return states[r->upstream_states->nelts - 1].status;
+}
+
+void addHttpStatusErrorType(BatchExporter::Span& span, ngx_uint_t status)
+{
+    if (status < 400) {
+        return;
+    }
+
+    // OpenTelemetry HTTP CLIENT status rules treat both 4xx and 5xx as errors
+    // when the instrumentation has no application-specific context.  error.type
+    // is the decimal HTTP status string when a response status was received.
+    char buf[NGX_INT64_LEN];
+    auto begin = (u_char*)buf;
+    auto end = ngx_sprintf(begin, "%ui", status);
+    span.add("error.type", StrView(buf, end - begin));
+    span.setError();
+}
+
+void addClientServerAttrs(BatchExporter::Span& span, ngx_http_request_t* r)
+{
+    auto u = r->upstream;
+    if (u == NULL || u->upstream == NULL || u->upstream->host.len == 0) {
+        return;
+    }
+
+    // Use only the configuration-owned/static upstream name.  Deliberately do
+    // not use a request-resolved dynamic host for variable proxy_pass because it can be
+    // request-controlled and create high-cardinality attributes.
+    span.add("server.address", toStrView(u->upstream->host));
+    if (u->upstream->port != 0) {
+        span.add("server.port", static_cast<int>(u->upstream->port));
+    }
+}
+
+bool validUpstreamMsec(ngx_msec_t value)
+{
+    return value != (ngx_msec_t)-1;
+}
+
+void addUpstreamAttemptEvents(BatchExporter::Span& span, ngx_http_request_t* r,
+    uint64_t observedAtNs)
+{
+    if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
+        return;
+    }
+
+    // Bound per-span event amplification.  Normal NGINX retry counts are small,
+    // but a very large upstream group/tries setting must not create an
+    // unbounded OTLP record on a hot request path.
+    static const ngx_uint_t MaxAttemptEvents = 16;
+
+    auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
+    auto count = r->upstream_states->nelts;
+    auto recorded = count < MaxAttemptEvents ? count : MaxAttemptEvents;
+
+    for (ngx_uint_t i = 0; i < recorded; ++i) {
+        auto state = &states[i];
+        span.addEvent("nginx.upstream.attempt", observedAtNs,
+            [state, i](BatchExporter::Span::Event& event) {
+                event.add("nginx.upstream.attempt", static_cast<int>(i + 1));
+
+                if (state->peer != NULL && state->peer->len != 0 &&
+                    state->peer->data != NULL)
+                {
+                    event.add("nginx.upstream.peer", toStrView(*state->peer));
+                }
+
+                // Do not emit http.response.status_code=0: zero means that no
+                // upstream HTTP response status was received for this attempt.
+                if (state->status != 0) {
+                    event.add("http.response.status_code",
+                        static_cast<int>(state->status));
+                }
+
+                // NGINX uses (ngx_msec_t)-1 as the not-observed sentinel for
+                // these timing fields.  Never cast the sentinel to a huge
+                // positive integer in OTLP.
+                if (validUpstreamMsec(state->connect_time)) {
+                    event.add("nginx.upstream.connect_time_ms",
+                        static_cast<int64_t>(state->connect_time));
+                }
+                if (validUpstreamMsec(state->header_time)) {
+                    event.add("nginx.upstream.header_time_ms",
+                        static_cast<int64_t>(state->header_time));
+                }
+                if (validUpstreamMsec(state->response_time)) {
+                    event.add("nginx.upstream.response_time_ms",
+                        static_cast<int64_t>(state->response_time));
+                }
+                if (state->response_length >= 0) {
+                    event.add("nginx.upstream.response_length",
+                        static_cast<int64_t>(state->response_length));
+                }
+                if (state->bytes_received >= 0) {
+                    event.add("nginx.upstream.bytes_received",
+                        static_cast<int64_t>(state->bytes_received));
+                }
+                if (state->bytes_sent >= 0) {
+                    event.add("nginx.upstream.bytes_sent",
+                        static_cast<int64_t>(state->bytes_sent));
+                }
+            });
+    }
+
+    if (count > recorded) {
+        span.add("nginx.upstream.attempt_events_dropped",
+            static_cast<int64_t>(count - recorded));
+    }
+}
+
+void addDefaultClientAttrs(BatchExporter::Span& span, ngx_http_request_t* r,
+    const OtelCtx* ctx, uint64_t observedAtNs)
+{
+    // sg4 uses the stable HTTP semantic attribute names for the extra CLIENT
+    // span.  It intentionally does NOT dual-write the old experimental names.
+    // The full-URL semantic attribute remains omitted to avoid duplicating request query strings/tokens;
+    // url.path is a documented privacy-oriented deviation for this custom module.
+    span.add("http.request.method", toStrView(r->method_name));
+
+    if (ctx != NULL && ctx->upstreamPath.len != 0 &&
+        ctx->upstreamPath.data != NULL)
+    {
+        span.add("url.path", toStrView(ctx->upstreamPath));
+    }
+
+    addClientServerAttrs(span, r);
+
+    if (r->upstream_states != NULL) {
+        span.add("nginx.upstream.attempts",
+            static_cast<int64_t>(r->upstream_states->nelts));
+    }
+
+    auto status = getFinalUpstreamStatus(r);
+    if (status != 0) {
+        span.add("http.response.status_code", static_cast<int>(status));
+        addHttpStatusErrorType(span, status);
+    } else {
+        // No HTTP status was received from the final upstream attempt.  Only mark
+        // the logical CLIENT span as an error when NGINX itself ended in a 5xx;
+        // this avoids misclassifying ordinary downstream 4xx/client-abort cases.
+        auto finalStatus = r->err_status ? r->err_status : r->headers_out.status;
+        if (finalStatus >= 500) {
+            span.add("error.type", "nginx.upstream.no_response");
+            span.setError();
+        }
+    }
+
+    // Events are recorded at LOG-phase observation time because the public
+    // upstream state structure exposes per-attempt durations but not an exact
+    // absolute timestamp for each attempt.  We do not fabricate a waterfall.
+    addUpstreamAttemptEvents(span, r, observedAtNs);
+}
+
 StrView getServerName(ngx_http_request_t* r)
 {
     auto cscf = (ngx_http_core_srv_conf_t*)
@@ -514,18 +954,40 @@ ngx_int_t onRequestEnd(ngx_http_request_t* r)
     auto toNanoSec = [](time_t sec, ngx_msec_t msec) -> uint64_t {
         return (sec * 1000 + msec) * 1000000;
     };
-
     try {
+        // Export CLIENT only if the final proxy module actually began at least
+        // one upstream attempt.  This drops cache HITs and phantom contexts.
+        if (ctx->upstreamActive && ctx->upstream.spanId.IsValid() &&
+            upstreamAttempted(r))
+        {
+            auto clientEndNs = toNanoSec(now->sec, now->msec);
+            BatchExporter::SpanInfo client{
+                getClientSpanName(r), ctx->upstream, ctx->current.spanId,
+                ctx->upstreamStartNs,
+                clientEndNs,
+                BatchExporter::SpanInfo::SpanKind::CLIENT};
+
+            bool clientOk = gExporter->add(client,
+                [r, ctx, clientEndNs](BatchExporter::Span& span) {
+                    addDefaultClientAttrs(span, r, ctx, clientEndNs);
+                });
+            if (!clientOk) {
+                ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                    "OTel sg4 dropped an upstream CLIENT span");
+            }
+        }
+
+        // Official v0.1.2 SERVER span behavior is preserved.
         BatchExporter::SpanInfo info{
             getSpanName(r), ctx->current, ctx->parent.spanId,
             toNanoSec(r->start_sec, r->start_msec),
-            toNanoSec(now->sec, now->msec)};
+            toNanoSec(now->sec, now->msec),
+            BatchExporter::SpanInfo::SpanKind::SERVER};
 
         bool ok = gExporter->add(info, [r](BatchExporter::Span& span) {
             addDefaultAttrs(span, r);
             addCustomAttrs(span, r);
         });
-
         if (!ok) {
             static size_t dropped = 0;
             static time_t lastLog = 0;
@@ -536,7 +998,6 @@ ngx_int_t onRequestEnd(ngx_http_request_t* r)
                     "OTel dropped records: %uz", dropped);
             }
         }
-
     } catch (const std::exception& e) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
             "OTel failed to add span: %s", e.what());
@@ -559,6 +1020,15 @@ ngx_int_t initModule(ngx_conf_t* cf)
 
     *h = onRequestStart;
 
+    // Register in PRECONTENT.  onUpstreamPrepare() dynamically verifies that it
+    // is the final handler in this phase before instrumenting.  This is required
+    // because OpenResty precontent_by_lua can reorder itself at request time.
+    h = (ngx_http_handler_pt*)ngx_array_push(
+        &cmcf->phases[NGX_HTTP_PRECONTENT_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+    *h = onUpstreamPrepare;
     h = (ngx_http_handler_pt*)ngx_array_push(
         &cmcf->phases[NGX_HTTP_LOG_PHASE].handlers);
     if (h == NULL) {
@@ -888,6 +1358,34 @@ ngx_int_t hexIdVar(ngx_http_request_t* r, ngx_http_variable_value_t* v,
     return NGX_OK;
 }
 
+ngx_int_t upstreamSpanIdVar(ngx_http_request_t* r, ngx_http_variable_value_t* v,
+    uintptr_t data)
+{
+    using opentelemetry::trace::SpanId;
+    auto ctx = getOtelCtx(r);
+    if (ctx == NULL || !ctx->upstreamActive || !upstreamAttempted(r) ||
+        !ctx->upstream.spanId.IsValid())
+    {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    auto id = &ctx->upstream.spanId;
+    auto size = id->Id().size() * 2;
+    auto buf = (char*)ngx_pnalloc(r->pool, size);
+    if (buf == NULL) {
+        return NGX_ERROR;
+    }
+
+    id->ToLowerBase16({buf, size});
+    v->len = size;
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    v->data = (u_char*)buf;
+    return NGX_OK;
+}
+
 ngx_int_t parentSampledVar(ngx_http_request_t* r, ngx_http_variable_value_t* v,
     uintptr_t data)
 {
@@ -919,6 +1417,8 @@ ngx_int_t addVariables(ngx_conf_t* cf)
         { ngx_string("otel_parent_id"), NULL, hexIdVar<SpanId>,
             offsetof(OtelCtx, parent.spanId) },
 
+        { ngx_string("otel_upstream_span_id"), NULL, upstreamSpanIdVar },
+
         { ngx_string("otel_parent_sampled"), NULL, parentSampledVar }
     };
 
@@ -944,6 +1444,7 @@ void* createLocationConf(ngx_conf_t* cf)
     conf->trace = (ngx_http_complex_value_t*)NGX_CONF_UNSET_PTR;
     conf->traceContext = NGX_CONF_UNSET_UINT;
     conf->spanName = (ngx_http_complex_value_t*)NGX_CONF_UNSET_PTR;
+    conf->upstreamSpan = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -956,6 +1457,7 @@ char* mergeLocationConf(ngx_conf_t* cf, void* parent, void* child)
     ngx_conf_merge_ptr_value(conf->trace, prev->trace, NULL);
     ngx_conf_merge_uint_value(conf->traceContext, prev->traceContext, 0);
     ngx_conf_merge_ptr_value(conf->spanName, prev->spanName, NULL);
+    ngx_conf_merge_value(conf->upstreamSpan, prev->upstreamSpan, 0);
 
     if (conf->spanAttrs.elts == NULL) {
         conf->spanAttrs = prev->spanAttrs;

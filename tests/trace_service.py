@@ -1,3 +1,5 @@
+# Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
+# See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 import concurrent
 import grpc
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2
@@ -29,6 +31,20 @@ class TraceService(trace_service_pb2_grpc.TraceServiceServicer):
         assert len(batch.scope_spans) == 1
         assert len(batch.scope_spans[0].spans) == 1
         return batch.scope_spans[0].spans.pop()
+
+    def get_spans(self, count):
+        for _ in range(100):
+            spans = []
+            for resource_batch in self.batches:
+                for resource in resource_batch:
+                    for scope in resource.scope_spans:
+                        spans.extend(scope.spans)
+            if len(spans) >= count:
+                break
+            time.sleep(0.001)
+        assert len(spans) == count
+        self.batches.clear()
+        return spans
 
 
 @pytest.fixture(scope="module")

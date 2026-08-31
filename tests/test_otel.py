@@ -1,9 +1,12 @@
+# Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
+# See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 from collections import namedtuple
 import niquests
 import pytest
 import socket
 import time
 import urllib3
+from opentelemetry.proto.trace.v1 import trace_pb2
 
 
 NGINX_CONFIG = """
@@ -20,6 +23,15 @@ http {
     ssl_certificate localhost.crt;
     ssl_certificate_key localhost.key;
 
+
+    # sg4 retry fixture: primary intentionally refuses connections; backup is
+    # this same NGINX instance.  This produces two ngx_http_upstream_state_t
+    # entries without any peer callback instrumentation.
+    upstream sg4_retry_backend {
+        server 127.0.0.1:18081 max_fails=0;
+        server 127.0.0.1:18080 backup;
+    }
+
     otel_exporter {
         endpoint {{ endpoint or "127.0.0.1:14317" }};
         interval {{ interval or "1ms" }};
@@ -30,6 +42,7 @@ http {
     }
 
     otel_trace on;
+    {{ upstream_span }}
     {{ resource_attrs }}
 
     server {
@@ -92,6 +105,60 @@ http {
             add_header "X-Otel-Traceparent" $http_traceparent;
             add_header "X-Otel-Tracestate" $http_tracestate;
             return 204;
+        }
+
+
+        # sg4 integration fixtures.  The switch itself is set at http{} scope
+        # by the individual tests, matching the intended production config.
+        location /sg4-backend {
+            return 204;
+        }
+        location /sg4-backend-404 {
+            return 404;
+        }
+        location /sg4-proxy {
+            add_header "X-Otel-Upstream-Span-Id" $otel_upstream_span_id always;
+            proxy_pass http://127.0.0.1:18080/sg4-backend;
+        }
+        location /sg4-proxy-404 {
+            proxy_pass http://127.0.0.1:18080/sg4-backend-404;
+        }
+        location /sg4-no-response {
+            proxy_connect_timeout 100ms;
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18081/sg4-backend;
+        }
+        location /sg4-rewrite {
+            rewrite ^ /sg4-proxy last;
+        }
+        location /sg4-off {
+            otel_upstream_span off;
+            proxy_pass http://127.0.0.1:18080/sg4-backend;
+        }
+        location /sg4-noheaders {
+            proxy_pass_request_headers off;
+            proxy_pass http://127.0.0.1:18080/sg4-backend;
+        }
+        location /sg4-explicit-traceparent {
+            proxy_set_header traceparent "00-11111111111111111111111111111111-2222222222222222-01";
+            proxy_pass http://127.0.0.1:18080/sg4-backend;
+        }
+        location /sg4-access-deny {
+            deny all;
+            proxy_pass http://127.0.0.1:18080/sg4-backend;
+        }
+        location /sg4-try-files {
+            try_files /sg4-file-that-does-not-exist @sg4-named-proxy;
+        }
+        location @sg4-named-proxy {
+            proxy_pass http://127.0.0.1:18080/sg4-backend;
+        }
+        location /sg4-retry {
+            add_header "X-Otel-Upstream-Span-Id" $otel_upstream_span_id always;
+            proxy_connect_timeout 100ms;
+            proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
+            proxy_next_upstream_tries 2;
+            proxy_pass http://sg4_retry_backend/sg4-backend;
         }
     }
 }
@@ -238,6 +305,187 @@ def test_context(client, trace_service, parent, path):
 
     assert r.headers.get("X-Otel-Traceparent") == headers["Traceparent"]
     assert r.headers.get("X-Otel-Tracestate") == headers["Tracestate"]
+
+
+def sg4_http_config():
+    return """
+        otel_trace_context propagate;
+        otel_upstream_span on;
+    """
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_static_path_does_not_create_client(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/ok").status_code == 200
+    span = trace_service.get_span()
+    assert span.kind == trace_pb2.Span.SPAN_KIND_SERVER
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_proxy_parenting_and_query_redaction(client, trace_service):
+    secret = "SG4-SECRET-MUST-NOT-APPEAR"
+    r = client.get(f"http://127.0.0.1:18080/sg4-proxy?token={secret}")
+    assert r.status_code == 204
+
+    spans = trace_service.get_spans(3)
+    server_spans = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_SERVER]
+    client_spans = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT]
+    assert len(server_spans) == 2
+    assert len(client_spans) == 1
+
+    frontend = next(s for s in server_spans if s.name == "/sg4-proxy")
+    backend = next(s for s in server_spans if s.name == "/sg4-backend")
+    outgoing = client_spans[0]
+
+    assert frontend.trace_id == outgoing.trace_id == backend.trace_id
+    assert outgoing.parent_span_id == frontend.span_id
+    assert backend.parent_span_id == outgoing.span_id
+    assert r.headers["X-Otel-Upstream-Span-Id"] == outgoing.span_id.hex()
+    assert get_attr(outgoing, "http.response.status_code") == 204
+    assert get_attr(outgoing, "http.request.method") == "GET"
+    assert get_attr(outgoing, "http.method") is None
+    assert get_attr(outgoing, "http.status_code") is None
+    assert get_attr(outgoing, "url.path") == "/sg4-proxy"
+    assert len(outgoing.events) == 1
+    event = outgoing.events[0]
+    assert event.name == "nginx.upstream.attempt"
+    assert event.time_unix_nano == outgoing.end_time_unix_nano
+    assert get_attr(event, "nginx.upstream.attempt") == 1
+    assert get_attr(event, "http.response.status_code") == 204
+    assert "127.0.0.1:18080" in get_attr(event, "nginx.upstream.peer")
+    assert get_attr(event, "nginx.upstream.response_time_ms") >= 0
+    assert "?" not in get_attr(outgoing, "url.path")
+    assert get_attr(outgoing, "url.full") is None
+    assert get_attr(outgoing, "http.target") is None
+    for attr in outgoing.attributes:
+        if attr.value.WhichOneof("value") == "string_value":
+            assert secret not in attr.value.string_value
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_internal_rewrite_keeps_server_client_server_chain(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-rewrite").status_code == 204
+    spans = trace_service.get_spans(3)
+    server_spans = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_SERVER]
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    frontend = next(s for s in server_spans if s.name == "/sg4-proxy")
+    backend = next(s for s in server_spans if s.name == "/sg4-backend")
+    assert outgoing.parent_span_id == frontend.span_id
+    assert backend.parent_span_id == outgoing.span_id
+    assert get_attr(outgoing, "url.path") == "/sg4-proxy"
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_retry_events_preserve_one_wire_client_span(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-retry").status_code == 204
+    spans = trace_service.get_spans(3)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    backend = next(
+        s for s in spans
+        if s.kind == trace_pb2.Span.SPAN_KIND_SERVER and s.name == "/sg4-backend"
+    )
+
+    assert backend.parent_span_id == outgoing.span_id
+    assert get_attr(outgoing, "nginx.upstream.attempts") == 2
+    assert get_attr(outgoing, "http.response.status_code") == 204
+    assert len(outgoing.events) == 2
+
+    first, second = outgoing.events
+    assert get_attr(first, "nginx.upstream.attempt") == 1
+    assert get_attr(second, "nginx.upstream.attempt") == 2
+    assert "127.0.0.1:18081" in get_attr(first, "nginx.upstream.peer")
+    assert "127.0.0.1:18080" in get_attr(second, "nginx.upstream.peer")
+    assert get_attr(first, "http.response.status_code") is None
+    assert get_attr(second, "http.response.status_code") == 204
+    assert first.time_unix_nano == outgoing.end_time_unix_nano
+    assert second.time_unix_nano == outgoing.end_time_unix_nano
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_upstream_404_uses_stable_status_and_error_type(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-proxy-404").status_code == 404
+    spans = trace_service.get_spans(3)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") == 404
+    assert get_attr(outgoing, "error.type") == "404"
+    assert outgoing.status.code == trace_pb2.Status.STATUS_CODE_ERROR
+    assert len(outgoing.events) == 1
+    assert get_attr(outgoing.events[0], "http.response.status_code") == 404
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_connect_failure_does_not_fabricate_http_status(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-no-response").status_code == 502
+    spans = trace_service.get_spans(2)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "error.type") == "nginx.upstream.no_response"
+    assert outgoing.status.code == trace_pb2.Status.STATUS_CODE_ERROR
+    assert get_attr(outgoing, "nginx.upstream.attempts") == 1
+    assert len(outgoing.events) == 1
+    assert get_attr(outgoing.events[0], "http.response.status_code") is None
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_location_off_overrides_global_on(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-off").status_code == 204
+    spans = trace_service.get_spans(2)
+    assert all(s.kind == trace_pb2.Span.SPAN_KIND_SERVER for s in spans)
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_pass_request_headers_off_skips_client(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-noheaders").status_code == 204
+    spans = trace_service.get_spans(2)
+    assert all(s.kind == trace_pb2.Span.SPAN_KIND_SERVER for s in spans)
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_explicit_traceparent_override_skips_client(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-explicit-traceparent").status_code == 204
+    spans = trace_service.get_spans(2)
+    assert all(s.kind == trace_pb2.Span.SPAN_KIND_SERVER for s in spans)
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_access_rejection_does_not_create_client(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-access-deny").status_code == 403
+    span = trace_service.get_span()
+    assert span.kind == trace_pb2.Span.SPAN_KIND_SERVER
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_try_files_named_proxy_parenting(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-try-files").status_code == 204
+    spans = trace_service.get_spans(3)
+    server_spans = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_SERVER]
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    backend = next(s for s in server_spans if s.name == "/sg4-backend")
+    frontend = next(s for s in server_spans if s.span_id == outgoing.parent_span_id)
+    assert frontend.trace_id == outgoing.trace_id == backend.trace_id
+    assert backend.parent_span_id == outgoing.span_id
 
 
 @pytest.mark.parametrize(

@@ -1,3 +1,5 @@
+// Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
+// See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 #pragma once
 
 #include <nginx.h>
@@ -5,6 +7,7 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <cstdint>
 
 #include "str_view.hpp"
 #include "trace_context.hpp"
@@ -16,11 +19,17 @@ public:
     typedef TraceServiceClient::Response Response;
 
     struct SpanInfo {
+        enum class SpanKind {
+            SERVER,
+            CLIENT
+        };
+
         StrView name;
         TraceContext trace;
         opentelemetry::trace::SpanId parent;
         uint64_t start;
         uint64_t end;
+        SpanKind kind;
     };
 
     class Span {
@@ -31,8 +40,9 @@ public:
         Span(const SpanInfo& info, opentelemetry::proto::trace::v1::Span* span)
             : span(span)
         {
-            span->set_kind(
-                opentelemetry::proto::trace::v1::Span::SPAN_KIND_SERVER);
+            span->set_kind(info.kind == SpanInfo::SpanKind::CLIENT
+                ? opentelemetry::proto::trace::v1::Span::SPAN_KIND_CLIENT
+                : opentelemetry::proto::trace::v1::Span::SPAN_KIND_SERVER);
 
             // Short setters, like set_name(), use additional std::string as an
             // intermediary at least up to v21.5 of protobuf.
@@ -57,6 +67,7 @@ public:
         ~Span()
         {
             truncate(span->mutable_attributes(), attrSize);
+            truncate(span->mutable_events(), eventSize);
         }
 
         void add(StrView key, StrView value)
@@ -66,6 +77,10 @@ public:
         }
 
         void add(StrView key, int value)
+        {
+            add(key)->mutable_value()->set_int_value(value);
+        }
+        void add(StrView key, int64_t value)
         {
             add(key)->mutable_value()->set_int_value(value);
         }
@@ -84,6 +99,69 @@ public:
         {
             span->mutable_status()->set_code(
                 opentelemetry::proto::trace::v1::Status::STATUS_CODE_ERROR);
+        }
+
+        class Event {
+        public:
+            Event(const Event&) = delete;
+            Event& operator=(const Event&) = delete;
+
+            explicit Event(opentelemetry::proto::trace::v1::Span::Event* event)
+                : event(event)
+            {
+            }
+            ~Event()
+            {
+                // Span protobufs are batch-reused.  Remove stale attributes from
+                // a prior request when the same Event message is reused.
+                auto attrs = event->mutable_attributes();
+                while (attrs->size() > attrSize) {
+                    attrs->RemoveLast();
+                }
+            }
+
+            void add(StrView key, StrView value)
+            {
+                add(key)->mutable_value()->mutable_string_value()->assign(
+                    value.data(), value.size());
+            }
+            void add(StrView key, int value)
+            {
+                add(key)->mutable_value()->set_int_value(value);
+            }
+            void add(StrView key, int64_t value)
+            {
+                add(key)->mutable_value()->set_int_value(value);
+            }
+
+        private:
+            opentelemetry::proto::common::v1::KeyValue* add(StrView key)
+            {
+                auto attrs = event->mutable_attributes();
+                auto newAttr = attrs->size() > attrSize ?
+                    attrs->Mutable(attrSize) : attrs->Add();
+                newAttr->mutable_key()->assign(key.data(), key.size());
+                ++attrSize;
+                return newAttr;
+            }
+
+            opentelemetry::proto::trace::v1::Span::Event* event;
+            int attrSize{0};
+        };
+
+        template <class F>
+        void addEvent(StrView name, uint64_t timeUnixNano, F fillEvent)
+        {
+            auto events = span->mutable_events();
+            auto event = events->size() > eventSize ?
+                events->Mutable(eventSize) : events->Add();
+
+            set(event->mutable_name(), name);
+            event->set_time_unix_nano(timeUnixNano);
+
+            Event wrapper(event);
+            fillEvent(wrapper);
+            ++eventSize;
         }
 
     private:
@@ -109,6 +187,7 @@ public:
 
         opentelemetry::proto::trace::v1::Span* span;
         int attrSize{0};
+        int eventSize{0};
     };
 
     BatchExporter(const Target& target,
