@@ -37,6 +37,8 @@ jobs:
           cmake -DNGX_OTEL_NGINX_BUILD_DIR=${PWD}/../nginx/objs \
                 -DNGX_OTEL_DEV=ON ..
           make -j $(nproc)
+      - name: Verify nginx core tracked sources unchanged
+        run: git -C nginx diff --exit-code -- .
       - name: Download otelcol
         run: |
           LATEST=open-telemetry/opentelemetry-collector-releases/releases/latest

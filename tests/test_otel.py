@@ -151,8 +151,25 @@ http {
             try_files /sg4-file-that-does-not-exist @sg4-named-proxy;
         }
         location @sg4-named-proxy {
-            proxy_pass http://127.0.0.1:18080/sg4-backend;
+            # NGINX forbids a URI part on proxy_pass inside a named location.
+            # Rewrite the URI in-place, then proxy without a proxy_pass URI.
+            rewrite ^ /sg4-backend break;
+            proxy_pass http://127.0.0.1:18080;
         }
+        # Native proxy-semantics fixture. The same proxy is exercised with
+        # otel_upstream_span at default off and with SG4 enabled. Normal HTTP
+        # status/body/query/header behavior must stay the same.
+        location /sg4-native-backend {
+            add_header "X-SG4-Native-Method" $request_method always;
+            add_header "X-SG4-Native-Arg" $arg_probe always;
+            add_header "X-SG4-Native-Header" $http_x_sg4_native always;
+            return 201 "SG4-NATIVE-OK";
+        }
+        location /sg4-native-proxy {
+            add_header "X-Otel-Upstream-Span-Id" $otel_upstream_span_id always;
+            proxy_pass http://127.0.0.1:18080/sg4-native-backend;
+        }
+
         location /sg4-retry {
             add_header "X-Otel-Upstream-Span-Id" $otel_upstream_span_id always;
             proxy_connect_timeout 100ms;
@@ -486,6 +503,55 @@ def test_sg4_try_files_named_proxy_parenting(client, trace_service):
     frontend = next(s for s in server_spans if s.span_id == outgoing.parent_span_id)
     assert frontend.trace_id == outgoing.trace_id == backend.trace_id
     assert backend.parent_span_id == outgoing.span_id
+
+
+def assert_sg4_native_proxy_response(r):
+    assert r.status_code == 201
+    assert r.text == "SG4-NATIVE-OK"
+    assert r.headers["X-SG4-Native-Method"] == "GET"
+    assert r.headers["X-SG4-Native-Arg"] == "native-query"
+    assert r.headers["X-SG4-Native-Header"] == "native-header"
+
+
+# The module is loaded, but the SG4 upstream CLIENT feature is left at its
+# default off state. Native proxy response semantics must remain unchanged.
+def test_sg4_default_off_preserves_native_proxy_semantics(client, trace_service):
+    r = client.get(
+        "http://127.0.0.1:18080/sg4-native-proxy?probe=native-query",
+        headers={"X-SG4-Native": "native-header"},
+    )
+    assert_sg4_native_proxy_response(r)
+    assert not r.headers.get("X-Otel-Upstream-Span-Id")
+    spans = trace_service.get_spans(2)
+    assert len(spans) == 2
+    assert all(s.kind == trace_pb2.Span.SPAN_KIND_SERVER for s in spans)
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg4_enabled_preserves_native_proxy_semantics_and_emits_client(
+    client, trace_service
+):
+    r = client.get(
+        "http://127.0.0.1:18080/sg4-native-proxy?probe=native-query",
+        headers={"X-SG4-Native": "native-header"},
+    )
+    assert_sg4_native_proxy_response(r)
+    spans = trace_service.get_spans(3)
+    client_spans = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT]
+    server_spans = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_SERVER]
+    assert len(client_spans) == 1
+    assert len(server_spans) == 2
+    outgoing = client_spans[0]
+    frontend = next(s for s in server_spans if s.name == "/sg4-native-proxy")
+    backend = next(s for s in server_spans if s.name == "/sg4-native-backend")
+    assert outgoing.parent_span_id == frontend.span_id
+    assert backend.parent_span_id == outgoing.span_id
+    assert r.headers["X-Otel-Upstream-Span-Id"] == outgoing.span_id.hex()
+    assert len(r.headers["X-Otel-Upstream-Span-Id"]) == 16
+    assert get_attr(outgoing, "http.response.status_code") == 201
+    assert get_attr(outgoing, "url.path") == "/sg4-native-proxy"
 
 
 @pytest.mark.parametrize(

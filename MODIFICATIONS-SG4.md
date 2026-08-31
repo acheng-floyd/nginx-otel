@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7/SG4.8 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -132,3 +132,9 @@ Update Dependabot configuration for GitHub Actions
 That commit is a direct child of the SG4.4 release commit and changes only `.github/dependabot.yml`. SG4.7 pins the exact commit SHA and re-verifies the direct-parent relationship, one-commit range, exact `M .github/dependabot.yml` path/status, and absence of runtime/test/build changes. Any different post-SG4.4 history is rejected pending a new review.
 
 The final SG4.7 tree still removes `.github/dependabot.yml` according to the SG4.5 policy. The reviewed intermediate commit is preserved only as immutable Git history, and the SG4.7 release commit is a normal fast-forward child of the actual destination `main`.
+
+## SG4.8 native-safety/test follow-up
+
+`v0.1.2-pr97-sg4.8` keeps the SG4.7 runtime tracing implementation unchanged. It repairs the invalid named-location pytest fixture, adds explicit native-proxy non-interference and module-active tests, and adds a CI gate that fails if tracked NGINX core source files are modified.
+
+The generated repository remains an nginx-otel module fork. It does not vendor or patch NGINX core. CI checks out NGINX 1.31.1 separately and builds the dynamic module against that checkout.
