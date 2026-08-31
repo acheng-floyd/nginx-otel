@@ -9,7 +9,7 @@ Reviewed upstream baseline:
 72d8eed53af4c2cd6f3e30a2efe0e38d66f5e176
 ```
 
-SG4/SG4.1/SG4.2/SG4.3/SG4.4 modifies the following upstream files when the custom repository is
+SG4/SG4.1/SG4.2/SG4.3/SG4.4/SG4.5/SG4.6/SG4.7 modifies the following upstream files when the custom repository is
 generated:
 
 ```text
@@ -18,9 +18,11 @@ src/batch_exporter.hpp
 src/http_module.cpp
 tests/test_otel.py
 tests/trace_service.py
+.github/workflows/ubuntu.yml
+.github/dependabot.yml  # removed by generated SG4.5+ tree; SG4.7 preserves the reviewed intermediate management commit only in Git history
 ```
 
-Each of those generated files contains a prominent downstream-modification notice.
+Each retained modified generated file contains a prominent downstream-modification notice; deleted policy files are documented here instead.
 
 ## Functional modifications
 
@@ -92,3 +94,41 @@ before the strict staging gate. It also avoids rewriting an already-existing
 annotated remote tag when that tag peels to the same generated commit.
 
 See `audit/SG4.4_PUBLICATION_FIX_AUDIT.md`.
+
+## SG4.5 compile/CI follow-up
+
+`v0.1.2-pr97-sg4.5` keeps the SG4 CLIENT-span runtime model and adds only the following compile/CI policy fixes:
+
+- `src/http_module.cpp`: legacy SERVER `http.status_code` now casts `ngx_uint_t` to `int` explicitly to avoid ambiguity after SG4 added an `int64_t` BatchExporter attribute overload. HTTP status values are safely within `int`.
+- `.github/workflows/ubuntu.yml`: CI checks out `nginx/nginx` at `release-1.31.1`, matching the audited ABI/version guard.
+- `.github/dependabot.yml`: removed. The upstream file only enabled weekly GitHub Actions version-update PRs; this audited downstream fork uses deliberate/manual CI dependency upgrades instead.
+
+These changes do not alter the SG4 CLIENT-span runtime model.
+
+
+## SG4.6 publication-commit follow-up
+
+`v0.1.2-pr97-sg4.6` does not change the generated SG4.5 source/test/CI tree. It changes only the repository-construction publication mechanism for an existing SG4.4 destination:
+
+- freezes the fully staged/audited candidate source with `git write-tree`;
+- creates the release commit with `git commit-tree` and an explicitly verified SG4.4 parent;
+- verifies the new commit tree equals the frozen candidate tree and that the parent is exact;
+- moves the local branch to that commit and requires a clean repository before tag/pre-push.
+
+This replaces the SG4.5 `git reset --soft` re-parent path and prevents a staged-only intermediate tree from being treated as a publishable repository.
+
+
+## SG4.7 reviewed destination-history follow-up
+
+`v0.1.2-pr97-sg4.7` does not change the generated SG4.6 runtime/source/test/CI tree. It changes only how an already-published downstream history is accepted as a parent.
+
+The actual downstream `main` contains one separately reviewed repository-management commit after SG4.4:
+
+```text
+3a9fa6a4e2f841f3fdb8d4d8df4c5175c9182e40
+Update Dependabot configuration for GitHub Actions
+```
+
+That commit is a direct child of the SG4.4 release commit and changes only `.github/dependabot.yml`. SG4.7 pins the exact commit SHA and re-verifies the direct-parent relationship, one-commit range, exact `M .github/dependabot.yml` path/status, and absence of runtime/test/build changes. Any different post-SG4.4 history is rejected pending a new review.
+
+The final SG4.7 tree still removes `.github/dependabot.yml` according to the SG4.5 policy. The reviewed intermediate commit is preserved only as immutable Git history, and the SG4.7 release commit is a normal fast-forward child of the actual destination `main`.

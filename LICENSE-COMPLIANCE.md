@@ -22,7 +22,7 @@ The generated repository also receives:
 - `MODIFICATIONS-SG4.md` -- a prominent summary of downstream modifications.
 - `THIRD_PARTY_NOTICES.md` -- provenance and reference-project licensing notes.
 - `LICENSE-COMPLIANCE.md` -- this redistribution guidance.
-- Per-file modification notices in every upstream source/test file changed by SG4.
+- Per-file modification notices in every retained upstream source/test/CI file changed by SG4/SG4.5/SG4.6/SG4.7. The SG4.5 removal of `.github/dependabot.yml` is recorded in `MODIFICATIONS-SG4.md`.
 
 These measures are intended to make the Apache-2.0 redistribution obligations
 easy to audit, especially the requirements to keep the license, preserve notices,
@@ -34,7 +34,7 @@ When publishing this fork or distributing its source/binaries:
 
 1. Keep the upstream `LICENSE` file with the distribution.
 2. Do not remove upstream copyright, patent, attribution, or trademark notices. If the exact upstream revision contains a `NOTICE` file, retain and redistribute the applicable NOTICE content as required by Apache-2.0.
-3. Keep the SG4 modification notices in modified files.
+3. Keep the SG4 modification notices in retained modified files and keep `MODIFICATIONS-SG4.md` so deleted/replaced policy files remain documented.
 4. Keep `MODIFICATIONS-SG4.md` with source distributions.
 5. If you later copy or vendor third-party source code, re-check that project's
    license and NOTICE/attribution requirements; the current SG4 kit does not

@@ -878,7 +878,7 @@ void addDefaultAttrs(BatchExporter::Span& span, ngx_http_request_t* r)
 
     auto status = r->err_status ? r->err_status : r->headers_out.status;
     if (status) {
-        span.add("http.status_code", status);
+        span.add("http.status_code", static_cast<int>(status));
 
         if (status >= 500) {
             span.setError();

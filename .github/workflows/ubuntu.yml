@@ -1,3 +1,5 @@
+# Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
+# See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
 name: Ubuntu build
 
 on:
@@ -16,10 +18,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libc-ares-dev
-      - name: Checkout nginx
+      - name: Checkout nginx 1.31.1
         uses: actions/checkout@v4
         with:
           repository: nginx/nginx
+          ref: release-1.31.1
           path: nginx
       - name: Build nginx
         working-directory: nginx
