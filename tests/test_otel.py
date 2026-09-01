@@ -1,9 +1,15 @@
-# Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
-# See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
+# Modified downstream from nginx/nginx-otel v0.1.2 for SG5.
+# See MODIFICATIONS-SG5.md; inherited SG4 history remains documented; Apache-2.0.
 from collections import namedtuple
 import niquests
 import pytest
 import socket
+import time
+import contextlib
+import os
+import socket
+import struct
+import threading
 import time
 import urllib3
 from opentelemetry.proto.trace.v1 import trace_pb2
@@ -63,6 +69,8 @@ http {
         listen       127.0.0.1:18080;
         # sg4 test-only real HTTP 502 listener
         listen       127.0.0.1:18082;
+        # sg5 test-only real HTTP 504 listener
+        listen       127.0.0.1:18086;
 
         http2 on;
 
@@ -206,6 +214,40 @@ http {
             proxy_next_upstream error timeout http_502;
             proxy_next_upstream_tries 2;
             proxy_pass http://sg4_retry_http502_then_dead/sg4-backend;
+        }
+
+        # SG5 failure-classification fixtures.  These keep the client-facing
+        # NGINX 502/504 behavior unchanged and test telemetry only.
+        location /sg5-connect-timeout {
+            proxy_connect_timeout 100ms;
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18087/sg5-blackhole;
+        }
+        location /sg5-read-timeout {
+            proxy_connect_timeout 100ms;
+            proxy_read_timeout 100ms;
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18083/sg5-stall;
+        }
+        location /sg5-reset-before-header {
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18084/sg5-reset;
+        }
+        location /sg5-invalid-header {
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18085/sg5-invalid;
+        }
+        location /sg5-partial-header {
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18088/sg5-partial;
+        }
+        location /sg5-real-504-backend {
+            if ($server_port = 18086) { return 504; }
+            return 204;
+        }
+        location /sg5-real-504 {
+            proxy_next_upstream off;
+            proxy_pass http://127.0.0.1:18086/sg5-real-504-backend;
         }
     }
 }
@@ -352,6 +394,61 @@ def test_context(client, trace_service, parent, path):
 
     assert r.headers.get("X-Otel-Traceparent") == headers["Traceparent"]
     assert r.headers.get("X-Otel-Tracestate") == headers["Tracestate"]
+
+
+@contextlib.contextmanager
+def sg5_fault_server(port, mode):
+    ready = threading.Event()
+    errors = []
+
+    def run():
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", port))
+            server.listen(1)
+            server.settimeout(2.0)
+            ready.set()
+            conn, _ = server.accept()
+            try:
+                conn.settimeout(1.0)
+                try:
+                    conn.recv(65536)
+                except socket.timeout:
+                    pass
+
+                if mode == "stall":
+                    time.sleep(0.35)
+                elif mode == "reset":
+                    conn.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                elif mode == "invalid_header":
+                    conn.sendall(b"THIS IS NOT HTTP\\r\\n\\r\\n")
+                elif mode == "partial_header":
+                    conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: 5\\r\\n")
+                else:
+                    raise AssertionError(f"unsupported SG5 fault mode: {mode}")
+            finally:
+                conn.close()
+        except Exception as exc:
+            errors.append(exc)
+            ready.set()
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    assert ready.wait(2.0), f"SG5 fault server {port} did not become ready"
+    if errors:
+        raise errors[0]
+    try:
+        yield
+    finally:
+        thread.join(2.0)
+        assert not thread.is_alive(), f"SG5 fault server {port} did not stop"
+        if errors:
+            raise errors[0]
 
 
 def sg4_http_config():
@@ -538,6 +635,131 @@ def test_sg4_real_502_then_connect_failure_uses_final_no_response(client, trace_
     assert get_attr(first, "nginx.upstream.header_time_ms") >= 0
     assert get_attr(second, "http.response.status_code") is None
     assert get_attr(second, "nginx.upstream.header_time_ms") is None
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_connect_refused_is_coarse_connect_error_not_fake_http_status(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-no-response").status_code == 502
+    spans = trace_service.get_spans(2)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "nginx.downstream.status_code") == 502
+    assert get_attr(outgoing, "nginx.upstream.outcome") == "no_response"
+    assert get_attr(outgoing, "nginx.upstream.generated_status_code") == 502
+    assert get_attr(outgoing, "nginx.upstream.failure.type") == "connect_error"
+    assert get_attr(outgoing, "nginx.upstream.failure.phase") == "connect"
+    assert get_attr(outgoing, "error.type") == "nginx.upstream.no_response"
+
+
+@pytest.mark.skipif(
+    os.environ.get("NGX_OTEL_SG5_CONNECT_TIMEOUT") != "1",
+    reason="requires CI iptables DROP on 127.0.0.1:18087",
+)
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_connect_timeout_is_timeout_in_connect_phase(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg5-connect-timeout").status_code == 504
+    spans = trace_service.get_spans(2)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "nginx.downstream.status_code") == 504
+    assert get_attr(outgoing, "nginx.upstream.generated_status_code") == 504
+    assert get_attr(outgoing, "nginx.upstream.failure.type") == "timeout"
+    assert get_attr(outgoing, "nginx.upstream.failure.phase") == "connect"
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_response_header_timeout_is_timeout_after_connect(client, trace_service):
+    with sg5_fault_server(18083, "stall"):
+        assert client.get("http://127.0.0.1:18080/sg5-read-timeout").status_code == 504
+    spans = trace_service.get_spans(2)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "nginx.downstream.status_code") == 504
+    assert get_attr(outgoing, "nginx.upstream.generated_status_code") == 504
+    assert get_attr(outgoing, "nginx.upstream.failure.type") == "timeout"
+    assert get_attr(outgoing, "nginx.upstream.failure.phase") == "response_header"
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_reset_before_header_is_coarse_response_error(client, trace_service):
+    with sg5_fault_server(18084, "reset"):
+        assert client.get("http://127.0.0.1:18080/sg5-reset-before-header").status_code == 502
+    spans = trace_service.get_spans(2)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "nginx.upstream.generated_status_code") == 502
+    assert get_attr(outgoing, "nginx.upstream.failure.type") == "response_error"
+    assert get_attr(outgoing, "nginx.upstream.failure.phase") == "response_header"
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_invalid_header_is_coarse_response_error(client, trace_service):
+    with sg5_fault_server(18085, "invalid_header"):
+        assert client.get("http://127.0.0.1:18080/sg5-invalid-header").status_code == 502
+    spans = trace_service.get_spans(2)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "nginx.upstream.generated_status_code") == 502
+    assert get_attr(outgoing, "nginx.upstream.failure.type") == "response_error"
+    assert get_attr(outgoing, "nginx.upstream.failure.phase") == "response_header"
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_partial_header_close_is_coarse_response_error(client, trace_service):
+    with sg5_fault_server(18088, "partial_header"):
+        assert client.get("http://127.0.0.1:18080/sg5-partial-header").status_code == 502
+    spans = trace_service.get_spans(2)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") is None
+    assert get_attr(outgoing, "nginx.upstream.generated_status_code") == 502
+    assert get_attr(outgoing, "nginx.upstream.failure.type") == "response_error"
+    assert get_attr(outgoing, "nginx.upstream.failure.phase") == "response_header"
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_real_upstream_504_remains_real_http_response(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg5-real-504").status_code == 504
+    spans = trace_service.get_spans(3)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "http.response.status_code") == 504
+    assert get_attr(outgoing, "nginx.downstream.status_code") == 504
+    assert get_attr(outgoing, "nginx.upstream.outcome") == "http_response"
+    assert get_attr(outgoing, "nginx.upstream.generated_status_code") is None
+    assert get_attr(outgoing, "nginx.upstream.failure.type") is None
+    assert get_attr(outgoing, "error.type") == "504"
+
+
+@pytest.mark.parametrize(
+    "nginx_config", [{"upstream_span": sg4_http_config()}], indirect=True
+)
+def test_sg5_retry_connect_error_then_success_keeps_failure_on_attempt_event(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/sg4-retry").status_code == 204
+    spans = trace_service.get_spans(3)
+    outgoing = next(s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT)
+    assert get_attr(outgoing, "nginx.downstream.status_code") == 204
+    assert get_attr(outgoing, "nginx.upstream.outcome") == "http_response"
+    assert get_attr(outgoing, "nginx.upstream.failure.type") is None
+    first, second = outgoing.events
+    assert get_attr(first, "nginx.upstream.outcome") == "no_response"
+    assert get_attr(first, "nginx.upstream.generated_status_code") == 502
+    assert get_attr(first, "nginx.upstream.failure.type") == "connect_error"
+    assert get_attr(first, "nginx.upstream.failure.phase") == "connect"
+    assert get_attr(second, "nginx.upstream.outcome") == "http_response"
+    assert get_attr(second, "http.response.status_code") == 204
 
 
 @pytest.mark.parametrize(

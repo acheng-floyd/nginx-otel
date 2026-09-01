@@ -1,5 +1,5 @@
-// Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
-// See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
+// Modified downstream from nginx/nginx-otel v0.1.2 for SG5.
+// See MODIFICATIONS-SG5.md; inherited SG4 history remains documented; Apache-2.0.
 #include "ngx.hpp"
 
 #include "grpc_log.hpp"
@@ -708,6 +708,45 @@ bool validUpstreamMsec(ngx_msec_t value)
     return value != (ngx_msec_t)-1;
 }
 
+ngx_uint_t getDownstreamStatus(ngx_http_request_t* r)
+{
+    return r->err_status ? r->err_status : r->headers_out.status;
+}
+
+template <typename AttrTarget>
+void addSg5UpstreamOutcomeAttrs(AttrTarget& target,
+    const ngx_http_upstream_state_t& state)
+{
+    if (upstreamStateHasHttpResponse(state)) {
+        target.add("nginx.upstream.outcome", "http_response");
+        return;
+    }
+
+    // SG5 deliberately stays conservative: ngx_http_upstream_state_t does not
+    // retain errno/NGX_HTTP_UPSTREAM_FT_* after the failure path.  We classify
+    // only what the public state can prove and never label a generic 502 as
+    // exact ECONNREFUSED/ECONNRESET.
+    target.add("nginx.upstream.outcome", "no_response");
+    if (state.status == NGX_HTTP_BAD_GATEWAY ||
+        state.status == NGX_HTTP_GATEWAY_TIME_OUT)
+    {
+        target.add("nginx.upstream.generated_status_code",
+            static_cast<int>(state.status));
+    }
+
+    bool connected = validUpstreamMsec(state.connect_time);
+    if (state.status == NGX_HTTP_GATEWAY_TIME_OUT) {
+        target.add("nginx.upstream.failure.type", "timeout");
+        target.add("nginx.upstream.failure.phase",
+            connected ? "response_header" : "connect");
+    } else if (state.status == NGX_HTTP_BAD_GATEWAY) {
+        target.add("nginx.upstream.failure.type",
+            connected ? "response_error" : "connect_error");
+        target.add("nginx.upstream.failure.phase",
+            connected ? "response_header" : "connect");
+    }
+}
+
 void addUpstreamAttemptEvents(BatchExporter::Span& span, ngx_http_request_t* r,
     uint64_t observedAtNs)
 {
@@ -744,6 +783,7 @@ void addUpstreamAttemptEvents(BatchExporter::Span& span, ngx_http_request_t* r,
                     event.add("http.response.status_code",
                         static_cast<int>(state->status));
                 }
+                addSg5UpstreamOutcomeAttrs(event, *state);
 
                 // NGINX uses (ngx_msec_t)-1 as the not-observed sentinel for
                 // these timing fields.  Never cast the sentinel to a huge
@@ -803,6 +843,18 @@ void addDefaultClientAttrs(BatchExporter::Span& span, ngx_http_request_t* r,
             static_cast<int64_t>(r->upstream_states->nelts));
     }
 
+    auto downstreamStatus = getDownstreamStatus(r);
+    if (downstreamStatus != 0) {
+        span.add("nginx.downstream.status_code",
+            static_cast<int>(downstreamStatus));
+    }
+
+    if (r->upstream_states != NULL && r->upstream_states->nelts != 0) {
+        auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
+        addSg5UpstreamOutcomeAttrs(
+            span, states[r->upstream_states->nelts - 1]);
+    }
+
     auto status = getFinalUpstreamStatus(r);
     if (status != 0) {
         span.add("http.response.status_code", static_cast<int>(status));
@@ -811,7 +863,7 @@ void addDefaultClientAttrs(BatchExporter::Span& span, ngx_http_request_t* r,
         // No HTTP status was received from the final upstream attempt.  Only mark
         // the logical CLIENT span as an error when NGINX itself ended in a 5xx;
         // this avoids misclassifying ordinary downstream 4xx/client-abort cases.
-        auto finalStatus = r->err_status ? r->err_status : r->headers_out.status;
+        auto finalStatus = downstreamStatus;
         if (finalStatus >= 500) {
             span.add("error.type", "nginx.upstream.no_response");
             span.setError();

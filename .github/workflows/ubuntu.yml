@@ -1,10 +1,10 @@
-# Modified downstream from nginx/nginx-otel v0.1.2 for SG4.
-# See MODIFICATIONS-SG4.md; this downstream work remains Apache-2.0.
+# Modified downstream from nginx/nginx-otel v0.1.2 for SG5.
+# See MODIFICATIONS-SG5.md; inherited SG4 history remains documented; Apache-2.0.
 # SPDX-License-Identifier: Apache-2.0
-# Downstream SG4.17 dual-runtime CI: keep the SG4.16 runtime byte-identical and
-# require independent vanilla NGINX 1.31.1 and OpenResty 1.31.1.1 integration
-# gates. The final sg4-dual-runtime-gate succeeds only when both jobs succeed.
-name: SG4 dual runtime build and test
+# Downstream SG5 dual-runtime CI: preserve the SG4.17 qualified baseline and
+# add conservative upstream failure-classification integration coverage on exact
+# vanilla NGINX 1.31.1 and OpenResty 1.31.1.1.
+name: SG5 dual runtime + failure classification
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake curl jq libc-ares-dev libpcre2-dev \
-            libssl-dev perl pkg-config zlib1g-dev
+            iptables libssl-dev perl pkg-config zlib1g-dev
 
       - name: Checkout exact NGINX 1.31.1 release commit
         uses: actions/checkout@v4
@@ -87,7 +87,12 @@ jobs:
       - name: Install test dependencies
         run: pip install -r tests/requirements.txt
 
+      - name: Install deterministic SG5 connect-timeout fault
+        run: sudo iptables -I OUTPUT 1 -p tcp -d 127.0.0.1 --dport 18087 -j DROP
+
       - name: Run all vanilla NGINX regression cases
+        env:
+          NGX_OTEL_SG5_CONNECT_TIMEOUT: '1'
         run: |
           pytest tests/test_otel.py -vv --maxfail=1 \
             --junitxml=pytest-nginx.xml \
@@ -95,7 +100,7 @@ jobs:
             --module=build/ngx_otel_module.so \
             --otelcol=./otelcol
 
-      - name: Verify exactly forty vanilla NGINX tests executed
+      - name: Verify exactly forty-eight vanilla NGINX tests executed
         run: |
           python3 - <<'PYTEST_NGINX_SUMMARY'
           import xml.etree.ElementTree as ET
@@ -107,9 +112,13 @@ jobs:
               for key in ('tests', 'failures', 'errors', 'skipped')
           }
           print('Vanilla NGINX pytest totals:', totals)
-          if totals != {'tests': 40, 'failures': 0, 'errors': 0, 'skipped': 0}:
-              raise SystemExit('expected exactly 40 vanilla NGINX tests with zero failure/error/skip')
+          if totals != {'tests': 48, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit('expected exactly 48 vanilla NGINX tests with zero failure/error/skip')
           PYTEST_NGINX_SUMMARY
+
+      - name: Remove deterministic SG5 connect-timeout fault
+        if: ${{ always() }}
+        run: sudo iptables -D OUTPUT -p tcp -d 127.0.0.1 --dport 18087 -j DROP || true
 
   openresty-build-test:
     name: OpenResty 1.31.1.1 regression
@@ -128,7 +137,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake curl jq libc-ares-dev libpcre2-dev \
-            libssl-dev perl pkg-config zlib1g-dev
+            iptables libssl-dev perl pkg-config zlib1g-dev
 
       - name: Download exact OpenResty source
         run: |
@@ -214,6 +223,9 @@ jobs:
       - name: Install test dependencies
         run: pip install -r tests/requirements.txt
 
+      - name: Install deterministic SG5 connect-timeout fault
+        run: sudo iptables -I OUTPUT 1 -p tcp -d 127.0.0.1 --dport 18087 -j DROP
+
       - name: Run all OpenResty-specific qualification cases first
         env:
           NGX_OTEL_OPENRESTY_TESTS: '1'
@@ -243,6 +255,7 @@ jobs:
       - name: Run complete suite on installed OpenResty
         env:
           NGX_OTEL_OPENRESTY_TESTS: '1'
+          NGX_OTEL_SG5_CONNECT_TIMEOUT: '1'
         run: |
           pytest tests -vv \
             --junitxml=pytest-openresty.xml \
@@ -262,12 +275,16 @@ jobs:
               for key in ('tests', 'failures', 'errors', 'skipped')
           }
           print('OpenResty pytest totals:', totals)
-          if totals != {'tests': 46, 'failures': 0, 'errors': 0, 'skipped': 0}:
-              raise SystemExit('expected exactly 46 OpenResty tests with zero failure/error/skip')
+          if totals != {'tests': 54, 'failures': 0, 'errors': 0, 'skipped': 0}:
+              raise SystemExit('expected exactly 54 OpenResty tests with zero failure/error/skip')
           PYTEST_SUMMARY
 
-  sg4-dual-runtime-gate:
-    name: SG4 dual runtime gate
+      - name: Remove deterministic SG5 connect-timeout fault
+        if: ${{ always() }}
+        run: sudo iptables -D OUTPUT -p tcp -d 127.0.0.1 --dport 18087 -j DROP || true
+
+  sg5-dual-runtime-gate:
+    name: SG5 dual runtime + failure classification gate
     if: ${{ always() }}
     needs:
       - vanilla-nginx-build-test
@@ -284,4 +301,4 @@ jobs:
           echo "openresty-build-test=${OPENRESTY_RESULT}"
           test "${VANILLA_NGINX_RESULT}" = success
           test "${OPENRESTY_RESULT}" = success
-          echo 'PASS: SG4 vanilla NGINX 1.31.1 and OpenResty 1.31.1.1 gates both succeeded'
+          echo 'PASS: SG5 vanilla NGINX 1.31.1 and OpenResty 1.31.1.1 failure-classification gates both succeeded'

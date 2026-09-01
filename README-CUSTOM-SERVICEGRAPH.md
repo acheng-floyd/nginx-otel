@@ -1,6 +1,6 @@
-# nginx-otel v0.1.2 + reviewed PR #97 concept + SG4
+# nginx-otel v0.1.2 + reviewed PR #97 concept + SG5
 
-SG4 is a controlled OpenResty 1.31.1.1 / NGINX 1.31.1 derivative. It starts
+SG5 inherits the SG4.17 qualified runtime and adds conservative upstream failure classification. SG4.17 was a controlled OpenResty 1.31.1.1 / NGINX 1.31.1 derivative. It starts
 from the exact official nginx-otel v0.1.2 source and selectively implements the
 HTTP CLIENT / Service Graph goal without PR #97 peer-data or SSL-session callback
 wrappers.
@@ -56,6 +56,11 @@ server.port
 url.path
 error.type
 nginx.upstream.attempts
+nginx.downstream.status_code
+nginx.upstream.outcome
+nginx.upstream.generated_status_code
+nginx.upstream.failure.type
+nginx.upstream.failure.phase
 ```
 
 The custom CLIENT span does not emit `http.method`, `http.status_code`,
@@ -69,6 +74,21 @@ numeric response code string as `error.type`. If the final attempt produced no
 HTTP response and NGINX ends in 5xx, SG4 omits `http.response.status_code` and sets
 `error.type=nginx.upstream.no_response` rather than fabricating NGINX's downstream
 502/504 as an upstream response.
+
+SG5 adds a deliberately conservative diagnostic layer without changing the HTTP
+response sent by NGINX and without replacing SG4's `error.type` contract:
+
+- `nginx.downstream.status_code` is the final NGINX-to-client HTTP status.
+- `nginx.upstream.outcome` is `http_response` or `no_response`.
+- `nginx.upstream.generated_status_code` records a synthetic upstream-state
+  502/504 only when no real upstream HTTP response was observed.
+- `nginx.upstream.failure.type` is limited to `timeout`, `connect_error`, or
+  `response_error`; SG5 does not claim exact errno such as ECONNREFUSED/ECONNRESET.
+- `nginx.upstream.failure.phase` is `connect` or `response_header`.
+
+The same outcome/failure attributes are attached to retry attempt Events, so a
+failed attempt followed by a successful retry remains visible without changing
+the one-wire CLIENT span model.
 
 ## Batch-reuse safety
 
@@ -99,19 +119,20 @@ to NGINX 1.31.1. Re-audit before an OpenResty/NGINX core upgrade.
 
 This is a downstream modification of `nginx/nginx-otel` v0.1.2. The upstream
 project and this downstream modification are distributed under the Apache License,
-Version 2.0. Keep the repository `LICENSE`, `MODIFICATIONS-SG4.md`,
-`LICENSE-COMPLIANCE.md`, and applicable attribution notices when redistributing.
+Version 2.0. Keep the repository `LICENSE`, `MODIFICATIONS-SG4.md`, `MODIFICATIONS-SG5.md`,
+`SG5-DESIGN.md`, `LICENSE-COMPLIANCE.md`, and applicable attribution notices when redistributing.
 
 This is not an official F5/NGINX release and the Apache-2.0 license does not grant
 rights to NGINX/F5 trademarks.
 
 ## Qualification
 
-SG4.17 keeps the SG4.16 runtime instrumentation unchanged and requires two
-independent GitHub Actions jobs: exactly 40/40 `tests/test_otel.py` cases on
-vanilla NGINX 1.31.1, and 6/6 OpenResty-specific plus 46/46 complete-suite
-cases on OpenResty 1.31.1.1. The `sg4-dual-runtime-gate` job fails unless both
-runtime jobs succeed.
+SG5 keeps every SG4.17 regression test and adds eight failure-classification
+cases. GitHub Actions requires exactly 48/48 `tests/test_otel.py` cases on
+vanilla NGINX 1.31.1, and 6/6 OpenResty-specific plus 54/54 complete-suite
+cases on OpenResty 1.31.1.1. The `sg5-dual-runtime-gate` job fails unless both
+runtime jobs succeed. The connect-timeout case uses a CI-local iptables DROP
+rule so it cannot silently degrade into an immediate connection-refused test.
 
 This is not an official NGINX release. Also run CentOS 7.9 / Rocky 9 / Rocky 10
 builders, an ASan/UBSan qualification build where practical, and canary traffic
