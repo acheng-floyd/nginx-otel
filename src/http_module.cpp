@@ -1,5 +1,5 @@
-// Modified downstream from nginx/nginx-otel v0.1.2 for SG5.
-// See MODIFICATIONS-SG5.md; inherited SG4 history remains documented; Apache-2.0.
+// Modified downstream from nginx/nginx-otel v0.1.2 for SG5.1.
+// See MODIFICATIONS-SG5.1.md; inherited SG4/SG5 history remains documented; Apache-2.0.
 #include "ngx.hpp"
 
 #include "grpc_log.hpp"
@@ -658,17 +658,57 @@ bool upstreamStateHasHttpResponse(const ngx_http_upstream_state_t& state)
     return state.status != 0 && state.header_time != (ngx_msec_t)-1;
 }
 
-ngx_uint_t getFinalUpstreamStatus(ngx_http_request_t* r)
+bool isRealUpstreamAttempt(const ngx_http_upstream_state_t& state)
 {
-    // Describe the final wire attempt only. In particular, NGINX's synthetic
-    // transport-error 502/504 must not masquerade as a backend HTTP response.
+    // NGINX inserts an all-zero separator element (peer == NULL) between
+    // distinct upstream operations retained in r->upstream_states, for example
+    // proxy -> error_page -> second proxy.  Its own $upstream_* variable
+    // renderers treat that element as a separator, not an attempt.
+    return state.peer != NULL;
+}
+
+ngx_uint_t countRealUpstreamAttempts(ngx_http_request_t* r)
+{
     if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
         return 0;
     }
 
     auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
-    auto& finalState = states[r->upstream_states->nelts - 1];
-    return upstreamStateHasHttpResponse(finalState) ? finalState.status : 0;
+    ngx_uint_t count = 0;
+    for (ngx_uint_t i = 0; i < r->upstream_states->nelts; ++i) {
+        if (isRealUpstreamAttempt(states[i])) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+const ngx_http_upstream_state_t* getFinalRealUpstreamState(ngx_http_request_t* r)
+{
+    if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
+        return NULL;
+    }
+
+    auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
+    for (ngx_uint_t i = r->upstream_states->nelts; i != 0; --i) {
+        if (isRealUpstreamAttempt(states[i - 1])) {
+            return &states[i - 1];
+        }
+    }
+    return NULL;
+}
+
+ngx_uint_t getFinalUpstreamStatus(ngx_http_request_t* r)
+{
+    // Describe the final real wire attempt only. In particular, NGINX's
+    // synthetic transport-error 502/504 must not masquerade as a backend HTTP
+    // response, and an internal upstream-state separator must never become the
+    // logical final attempt.
+    auto finalState = getFinalRealUpstreamState(r);
+    if (finalState == NULL) {
+        return 0;
+    }
+    return upstreamStateHasHttpResponse(*finalState) ? finalState->status : 0;
 }
 
 void addHttpStatusErrorType(BatchExporter::Span& span, ngx_uint_t status)
@@ -714,18 +754,21 @@ ngx_uint_t getDownstreamStatus(ngx_http_request_t* r)
 }
 
 template <typename AttrTarget>
-void addSg5UpstreamOutcomeAttrs(AttrTarget& target,
+void addSg51FailureAttrs(AttrTarget& target,
     const ngx_http_upstream_state_t& state)
 {
+    // A real upstream HTTP response already has http.response.status_code, so
+    // adding SG5 classification keys to every successful request is redundant
+    // and expensive on a high-QPS NGINX path. SG5.1 emits extra diagnostics only
+    // when no real upstream HTTP response header was observed.
     if (upstreamStateHasHttpResponse(state)) {
-        target.add("nginx.upstream.outcome", "http_response");
         return;
     }
 
-    // SG5 deliberately stays conservative: ngx_http_upstream_state_t does not
-    // retain errno/NGX_HTTP_UPSTREAM_FT_* after the failure path.  We classify
-    // only what the public state can prove and never label a generic 502 as
-    // exact ECONNREFUSED/ECONNRESET.
+    // The retained public state does not preserve errno or the exact
+    // NGX_HTTP_UPSTREAM_FT_* provenance. Keep failure classification coarse and
+    // provable. In particular, connect_time proves only that NGINX reached the
+    // request-send path; a later timeout may be request-send OR response-read.
     target.add("nginx.upstream.outcome", "no_response");
     if (state.status == NGX_HTTP_BAD_GATEWAY ||
         state.status == NGX_HTTP_GATEWAY_TIME_OUT)
@@ -734,44 +777,47 @@ void addSg5UpstreamOutcomeAttrs(AttrTarget& target,
             static_cast<int>(state.status));
     }
 
-    bool connected = validUpstreamMsec(state.connect_time);
+    bool afterConnect = validUpstreamMsec(state.connect_time);
     if (state.status == NGX_HTTP_GATEWAY_TIME_OUT) {
         target.add("nginx.upstream.failure.type", "timeout");
-        target.add("nginx.upstream.failure.phase",
-            connected ? "response_header" : "connect");
+        target.add("nginx.upstream.failure.stage",
+            afterConnect ? "after_connect" : "connect");
     } else if (state.status == NGX_HTTP_BAD_GATEWAY) {
         target.add("nginx.upstream.failure.type",
-            connected ? "response_error" : "connect_error");
-        target.add("nginx.upstream.failure.phase",
-            connected ? "response_header" : "connect");
+            afterConnect ? "response_error" : "connect_error");
+        target.add("nginx.upstream.failure.stage",
+            afterConnect ? "after_connect" : "connect");
     }
 }
 
 void addUpstreamAttemptEvents(BatchExporter::Span& span, ngx_http_request_t* r,
     uint64_t observedAtNs)
 {
-    if (r->upstream_states == NULL || r->upstream_states->nelts == 0) {
+    auto realCount = countRealUpstreamAttempts(r);
+    if (realCount == 0) {
         return;
     }
 
-    // Bound per-span event amplification.  Normal NGINX retry counts are small,
-    // but a very large upstream group/tries setting must not create an
-    // unbounded OTLP record on a hot request path.
+    // Bound per-span event amplification. The cap applies to real wire attempts,
+    // not NGINX's peer==NULL separator elements between upstream operations.
     static const ngx_uint_t MaxAttemptEvents = 16;
 
     auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
-    auto count = r->upstream_states->nelts;
-    auto recorded = count < MaxAttemptEvents ? count : MaxAttemptEvents;
-
-    for (ngx_uint_t i = 0; i < recorded; ++i) {
+    ngx_uint_t emitted = 0;
+    for (ngx_uint_t i = 0;
+         i < r->upstream_states->nelts && emitted < MaxAttemptEvents; ++i)
+    {
         auto state = &states[i];
-        span.addEvent("nginx.upstream.attempt", observedAtNs,
-            [state, i](BatchExporter::Span::Event& event) {
-                event.add("nginx.upstream.attempt", static_cast<int>(i + 1));
+        if (!isRealUpstreamAttempt(*state)) {
+            continue;
+        }
 
-                if (state->peer != NULL && state->peer->len != 0 &&
-                    state->peer->data != NULL)
-                {
+        auto attempt = emitted + 1;
+        span.addEvent("nginx.upstream.attempt", observedAtNs,
+            [state, attempt](BatchExporter::Span::Event& event) {
+                event.add("nginx.upstream.attempt", static_cast<int>(attempt));
+
+                if (state->peer->len != 0 && state->peer->data != NULL) {
                     event.add("nginx.upstream.peer", toStrView(*state->peer));
                 }
 
@@ -783,10 +829,10 @@ void addUpstreamAttemptEvents(BatchExporter::Span& span, ngx_http_request_t* r,
                     event.add("http.response.status_code",
                         static_cast<int>(state->status));
                 }
-                addSg5UpstreamOutcomeAttrs(event, *state);
+                addSg51FailureAttrs(event, *state);
 
                 // NGINX uses (ngx_msec_t)-1 as the not-observed sentinel for
-                // these timing fields.  Never cast the sentinel to a huge
+                // these timing fields. Never cast the sentinel to a huge
                 // positive integer in OTLP.
                 if (validUpstreamMsec(state->connect_time)) {
                     event.add("nginx.upstream.connect_time_ms",
@@ -813,11 +859,12 @@ void addUpstreamAttemptEvents(BatchExporter::Span& span, ngx_http_request_t* r,
                         static_cast<int64_t>(state->bytes_sent));
                 }
             });
+        ++emitted;
     }
 
-    if (count > recorded) {
+    if (realCount > emitted) {
         span.add("nginx.upstream.attempt_events_dropped",
-            static_cast<int64_t>(count - recorded));
+            static_cast<int64_t>(realCount - emitted));
     }
 }
 
@@ -838,21 +885,22 @@ void addDefaultClientAttrs(BatchExporter::Span& span, ngx_http_request_t* r,
 
     addClientServerAttrs(span, r);
 
-    if (r->upstream_states != NULL) {
-        span.add("nginx.upstream.attempts",
-            static_cast<int64_t>(r->upstream_states->nelts));
+    auto realAttempts = countRealUpstreamAttempts(r);
+    if (realAttempts != 0) {
+        span.add("nginx.upstream.attempts", static_cast<int64_t>(realAttempts));
     }
 
     auto downstreamStatus = getDownstreamStatus(r);
-    if (downstreamStatus != 0) {
-        span.add("nginx.downstream.status_code",
-            static_cast<int>(downstreamStatus));
-    }
-
-    if (r->upstream_states != NULL && r->upstream_states->nelts != 0) {
-        auto states = (ngx_http_upstream_state_t*)r->upstream_states->elts;
-        addSg5UpstreamOutcomeAttrs(
-            span, states[r->upstream_states->nelts - 1]);
+    auto finalState = getFinalRealUpstreamState(r);
+    if (finalState != NULL && !upstreamStateHasHttpResponse(*finalState)) {
+        // Downstream status is useful specifically when NGINX had to synthesize
+        // or remap a response because the final upstream attempt produced no
+        // HTTP response. Avoid duplicating it on the normal success path.
+        if (downstreamStatus != 0) {
+            span.add("nginx.downstream.status_code",
+                static_cast<int>(downstreamStatus));
+        }
+        addSg51FailureAttrs(span, *finalState);
     }
 
     auto status = getFinalUpstreamStatus(r);

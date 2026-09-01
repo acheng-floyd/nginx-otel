@@ -50,3 +50,9 @@ The dual-runtime workflow now requires:
 - `audit/SG5_FAILURE_CLASSIFICATION_AUDIT.md`
 
 SG5 remains Apache-2.0 and does not modify the upstream LICENSE.
+
+## Follow-up
+
+`v0.1.2-pr97-sg5.1` is the immutable follow-up to this published SG5 release.
+See `MODIFICATIONS-SG5.1.md` and `SG5.1-AUDIT.md` for the failure-stage,
+success-path overhead, separator filtering, and Actions-test fixes.

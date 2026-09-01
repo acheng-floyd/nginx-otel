@@ -302,13 +302,14 @@ def test_openresty_error_page_second_proxy_preserves_wire_parentage(client, trac
     assert get_attr(outgoing, "http.response.status_code") == 204
     assert r.headers["X-Otel-Upstream-Span-Id"] == outgoing.span_id.hex()
 
-    # NGINX may retain an all-zero separator state between distinct upstream
-    # operations in r->upstream_states.  SG4.10 keeps multi-proxy boundaries as
-    # a documented residual, so qualify the two real wire operations by peer
-    # rather than declaring every raw array entry to be a retry attempt.
-    real_attempts = [e for e in attempt_events(outgoing)
-                     if get_attr(e, "nginx.upstream.peer") is not None]
+    # SG5.1 filters NGINX's peer==NULL upstream-state separator before attempt
+    # counting/event materialization. The exported sequence must contain only the
+    # two real wire operations, with contiguous 1-based attempt numbers.
+    real_attempts = attempt_events(outgoing)
+    assert get_attr(outgoing, "nginx.upstream.attempts") == 2
     assert len(real_attempts) == 2
+    assert [get_attr(e, "nginx.upstream.attempt") for e in real_attempts] == [1, 2]
+    assert all(get_attr(e, "nginx.upstream.peer") is not None for e in real_attempts)
     assert [get_attr(e, "http.response.status_code") for e in real_attempts] == [502, 204]
 
 

@@ -191,3 +191,16 @@ See our [release page](https://github.com/nginxinc/nginx-otel/releases) to keep 
 [Apache License, Version 2.0](https://github.com/nginxinc/nginx-otel/blob/main/LICENSE)
 
 &copy; [F5, Inc.](https://www.f5.com/) 2023
+
+---
+
+## Downstream SG5.1 release note
+
+This fork's `v0.1.2-pr97-sg5.1` release inherits the SG4.17/SG5 upstream CLIENT
+span model and adds conservative failure-only diagnostics. It filters NGINX
+`peer == NULL` upstream-state separators, replaces the over-precise
+`failure.phase=response_header` classification with
+`nginx.upstream.failure.stage=connect|after_connect`, and avoids redundant SG5
+classification fields on normal successful requests.
+
+See `MODIFICATIONS-SG5.1.md`, `SG5.1-DESIGN.md`, and `SG5.1-AUDIT.md`.

@@ -11,17 +11,20 @@ Upstream project:
 - Upstream license: Apache License 2.0
 - Upstream copyright/trademark notices remain the property of their respective owners.
 
-## What the generated repository does
+## What the SG5.1 generated repository does
 
-`create-custom-repo.sh` starts from the exact upstream `nginx-otel` v0.1.2 commit.
-The upstream `LICENSE` file is retained **unchanged**. SG4 downstream changes are
-then applied and committed on top.
+The SG5.1 `create-custom-repo.sh` starts from the exact already-published
+`v0.1.2-pr97-sg5` commit that was exercised by the supplied GitHub Actions run.
+The historical fork itself was originally reconstructed from the exact upstream
+`nginx-otel` v0.1.2 commit, and the upstream `LICENSE` remains unchanged.
 
 The generated repository also receives:
 
 - `MODIFICATIONS-SG4.md` -- inherited SG4 history and runtime modification record.
 - `MODIFICATIONS-SG5.md` -- SG5-specific runtime/test delta from frozen SG4.17.
-- `SG5-DESIGN.md` -- conservative upstream failure-classification semantics and limits.
+- `SG5-DESIGN.md` -- SG5 conservative failure-classification history.
+- `MODIFICATIONS-SG5.1.md` -- SG5.1 correctness/performance delta.
+- `SG5.1-DESIGN.md` / `SG5.1-AUDIT.md` -- current semantics and re-audit.
 - `THIRD_PARTY_NOTICES.md` -- provenance and reference-project licensing notes.
 - `LICENSE-COMPLIANCE.md` -- this redistribution guidance.
 - Per-file modification notices in every retained upstream source/test/CI file changed by SG4/SG4.5/SG4.6/SG4.8/SG4.9. SG4.10 added downstream OpenResty tests/workflow; SG4.11 retains the downstream tests and folds OpenResty build/test into the modified upstream ubuntu workflow with the existing downstream Apache-2.0 notice; SG4.12 changes only those downstream test/CI diagnostics; SG4.13 further changes only downstream test/CI trace isolation and adds no third-party runtime code. The SG4.5 removal of `.github/dependabot.yml` is recorded in `MODIFICATIONS-SG4.md`.
@@ -36,8 +39,8 @@ When publishing this fork or distributing its source/binaries:
 
 1. Keep the upstream `LICENSE` file with the distribution.
 2. Do not remove upstream copyright, patent, attribution, or trademark notices. If the exact upstream revision contains a `NOTICE` file, retain and redistribute the applicable NOTICE content as required by Apache-2.0.
-3. Keep the downstream modification notices in retained modified files and keep both `MODIFICATIONS-SG4.md` and `MODIFICATIONS-SG5.md` so inherited and SG5-specific changes remain documented.
-4. Keep `MODIFICATIONS-SG4.md`, `MODIFICATIONS-SG5.md`, and `SG5-DESIGN.md` with source distributions.
+3. Keep the downstream modification notices in retained modified files and keep `MODIFICATIONS-SG4.md`, `MODIFICATIONS-SG5.md`, and `MODIFICATIONS-SG5.1.md` so inherited and current changes remain documented.
+4. Keep `MODIFICATIONS-SG4.md`, `MODIFICATIONS-SG5.md`, `MODIFICATIONS-SG5.1.md`, `SG5-DESIGN.md`, `SG5.1-DESIGN.md`, and `SG5.1-AUDIT.md` with source distributions.
 5. If you later copy or vendor third-party source code, re-check that project's
    license and NOTICE/attribution requirements; the current SG4 kit does not
    vendor APISIX, Kong, or OpenTelemetry cpp-contrib source files.
@@ -63,3 +66,10 @@ This file is engineering-oriented compliance guidance, not legal advice.
 ## SG5 packaging note
 
 SG5 remains Apache-2.0. It adds no vendored third-party runtime source; the new iptables use is CI-only fault injection and is not part of the distributed module runtime. The generated repository retains the upstream LICENSE unchanged and carries both the inherited SG4 modification record and the SG5-specific delta/design documents.
+
+## SG5.1 packaging note
+
+SG5.1 remains Apache-2.0 and adds no vendored third-party runtime source. The new
+fault servers, 16 MiB send-timeout payload, and iptables DROP are test/CI-only.
+The distributed module runtime contains only the conservative telemetry changes
+documented in `MODIFICATIONS-SG5.1.md`.

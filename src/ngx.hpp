@@ -1,5 +1,5 @@
-// Modified downstream from nginx/nginx-otel v0.1.2 for SG5.
-// See MODIFICATIONS-SG5.md; inherited SG4 history remains documented; Apache-2.0.
+// Modified downstream from nginx/nginx-otel v0.1.2 for SG5.1.
+// See MODIFICATIONS-SG5.1.md; inherited SG4/SG5 history remains documented; Apache-2.0.
 #pragma once
 
 extern "C" {
