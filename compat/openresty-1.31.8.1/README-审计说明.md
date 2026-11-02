@@ -117,3 +117,21 @@ git push -u origin compat/openresty-1.31.8.1-audit
 - 源码本体公钥签名、第三方 SHA256 与正式站点实际归档的一致性，必须待 Actions 下载后核实。
 - 尤其关注 `proxy_next_upstream`、upstream keepalive、Lua 请求子请求与正常返回路径下的 OTel Span 真实性及性能；不能凭小范围本地脚本通过判断线上可升级。
 - 不自动合并 PR、不启用 auto-merge、不修改线上主机或监控阈值。
+
+---
+
+## 2026-11-03 严格复审：第一次 GitHub Actions 失败与 R2.0 增量补丁
+
+本节以 `compat/openresty-1.31.8.1-audit` 的提交 `bfbd9264c3fe6ea3c2923cac199d558d49983f93` 为增量补丁基线，**不是**再次执行 SG5→SG5.1 源码迁移，也不是对 `main` 打补丁。
+
+- 实际运行：[41531867465](https://github.com/acheng-floyd/nginx-otel/actions/runs/41531867465)。两个 Job 都失败于构建步骤 `src/ngx.hpp:17` 的 `#error`，要求 NGINX 1.31.1；官方源码 SHA256 和通知 `0x1/0x1` 检查均通过，实验副本的 `0x80` 修改成功。
+- 原版与修复对照都**没有完成** `ngx_otel_module.so` 构建、`nginx -t`、6/56 回归和 #1154 实际请求。此前 JUnit 的错误来自未生成 XML 的次生检查，不表示运行了 6/56 个失败用例。
+- `src/ngx.hpp` 的默认编译门禁保持 NGINX 1.31.1 不变。只有 **NGINX 1.31.8 + `NGX_OTEL_OPENRESTY_13181_LAB=1`** 同时成立才允许编译；宏为 0、错误版本或缺失宏均拒绝。CMake 选项 `NGX_OTEL_OPENRESTY_13181_LAB=OFF` 是默认值，实验启用必须同时启用 `NGX_OTEL_DEV=ON`。
+- CI 构建时只给 OTel 目标设置标记，显式检查该目标的编译参数，不修改运行时 C++ 算法、不修改 `ubuntu.yml`、不影响现有测试用例。
+- `keepalive` 的 OTel 子请求设计原先不严谨：SG5.1 在 `r != r->main` 时不产生 CLIENT。现在纯 balancer 仍用 Lua 子请求验证上游重复利用行为；OTel 分支改为两次带独立 traceparent 的主请求，断言两个 CLIENT 各自的父子关系、真实响应与仅一个 attempt，并验证连接复用计数。
+- 502→200 重试场景新增精确的 CLIENT 状态、attempt event 顺序、事件状态值 `[502, 200]`、peer 非空、父子 Span 关系和成功路径无额外故障字段等断言。合成 Span 的单元测试不能代替真实运行时测试。
+- 构建的 configure / make / install 日志会保存到两个矩阵各自的 Artifact；缺失 JUnit 的计数器不再在未执行测试时重复报错；正式版原有 6/56 精确数量门禁依然保持。
+
+**新增风险提示：** 上游 NGINX `src/http/modules/ngx_http_proxy_module.h` 在 1.31.1→1.31.8 将 `host_set` 成员替换为 `host_value`，`ngx_http_upstream_state_t` 在新版增加了 `NGX_COMPAT_BEGIN(2)` 兼容预留。虽然 OTel 只读取 `upstream`、`headers_source`、`proxy_lengths` 和 upstream-state 既有字段，不能凭成功编译或 `--with-compat` 推断私有结构体 ABI 已获得认证，必须依靠同一 NGINX 核心源码完整构建及运行时回归确认。OpenResty 打过自己的核心补丁，**仅比较原生 NGINX 头文件不足以完成最终认证**。
+
+**当前判定：仅修复了 CI 的编译前置门禁设计，未证明 OpenResty 1.31.8.1 可升级生产。** 要求下一次 GitHub CI 分别在原始发行版和 `0x80` 修复实验版中提供完整日志、动态库与模块加载证据、6/56 正式版回归及 #1154 结果。CentOS 7 / Rocky 9 / Rocky 10 和 Builder v1.0.11 均未在此次补丁中变更或实际认证。

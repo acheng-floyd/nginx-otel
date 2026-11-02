@@ -15,7 +15,7 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 
 BALANCER_RE = re.compile(r"lua balancer: (get|free) peer, tries: (\d+)")
@@ -83,6 +83,33 @@ http {{
     }}
 '''
     elif case == "keepalive":
+        # 普通复现保留上游的两次 Lua 子请求，以验证缓存连接返回事件。
+        # OTel 模式必须使用两次主请求：SG5.1 故意不为 r!=r->main 的子请求生成 CLIENT。
+        # 不能用“缺失的子请求 CLIENT”误判新版本不兼容。
+        if otel_port is None:
+            frontend_location = '''
+        location /t {
+            content_by_lua_block {
+                for i = 1, 2 do
+                    local res = ngx.location.capture("/proxy")
+                    ngx.print(res.status, ": ", res.body)
+                end
+            }
+        }
+        location /proxy {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+'''
+        else:
+            frontend_location = '''
+        location /t {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+'''
         upstream = f'''
     upstream backend {{
         server 127.0.0.1:9;
@@ -93,19 +120,7 @@ http {{
     }}
     server {{
         listen 127.0.0.1:{frontend};
-        location /t {{
-            content_by_lua_block {{
-                for i = 1, 2 do
-                    local res = ngx.location.capture("/proxy")
-                    ngx.print(res.status, ": ", res.body)
-                end
-            }}
-        }}
-        location /proxy {{
-            proxy_pass http://backend;
-            proxy_http_version 1.1;
-            proxy_set_header Connection "";
-        }}
+        {frontend_location}
     }}
     server {{
         listen 127.0.0.1:{backend1};
@@ -222,104 +237,142 @@ def span_attributes(span):
     return result
 
 
-def summarize_trace(spans, case):
+def summarize_trace(spans, case, external_parent_id):
+    """每次主请求必须得到严格且可追溯的 SERVER→CLIENT→SERVER 关系。"""
     from opentelemetry.proto.trace.v1 import trace_pb2
     clients = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_CLIENT]
-    attributes = [span_attributes(s) for s in clients]
-    result = {
+    servers = [s for s in spans if s.kind == trace_pb2.Span.SPAN_KIND_SERVER]
+    expected_attempts = 2 if case == "retry_502" else 1
+    if len(clients) != 1 or len(servers) != expected_attempts + 1:
+        raise AssertionError(
+            f"{case}：SERVER/CLIENT 数量不符，实测 {len(servers)}/{len(clients)}，"
+            f"期望 {expected_attempts + 1}/1"
+        )
+    client = clients[0]
+    root_servers = [s for s in servers if s.parent_span_id == external_parent_id]
+    if len(root_servers) != 1:
+        raise AssertionError(f"{case}：未找到唯一的入口 SERVER Span")
+    root = root_servers[0]
+    if client.parent_span_id != root.span_id:
+        raise AssertionError(f"{case}：CLIENT Span 不是入口 SERVER 的子级")
+    backends = [s for s in servers if s is not root]
+    if any(s.parent_span_id != client.span_id for s in backends):
+        raise AssertionError(f"{case}：上游 SERVER Span 与 CLIENT 父子关系不正确")
+
+    attributes = span_attributes(client)
+    events = [e for e in client.events if e.name == "nginx.upstream.attempt"]
+    statuses = [span_attributes(e).get("http.response.status_code") for e in events]
+    expected_statuses = [502, 200] if case == "retry_502" else [200]
+    if attributes.get("http.response.status_code") != 200:
+        raise AssertionError(f"{case}：CLIENT 缺少最终真实 HTTP 200 状态")
+    if attributes.get("nginx.upstream.attempts") != expected_attempts:
+        raise AssertionError(f"{case}：CLIENT attempts 非 {expected_attempts}")
+    if len(events) != expected_attempts or statuses != expected_statuses:
+        raise AssertionError(f"{case}：attempt 事件及真实 HTTP 状态不符：{statuses}")
+    if [span_attributes(e).get("nginx.upstream.attempt") for e in events] != list(
+            range(1, expected_attempts + 1)):
+        raise AssertionError(f"{case}：attempt 序号不是连续的 1-based")
+    if any(not span_attributes(e).get("nginx.upstream.peer") for e in events):
+        raise AssertionError(f"{case}：存在缺失 peer 的虚假 attempt 事件")
+    for key in ("error.type", "nginx.upstream.outcome", "nginx.downstream.status_code",
+                "nginx.upstream.failure.type", "nginx.upstream.failure.stage"):
+        if attributes.get(key) is not None:
+            raise AssertionError(f"{case}：最终成功的 CLIENT 不应出现 {key}")
+    if client.status.code == trace_pb2.Status.STATUS_CODE_ERROR:
+        raise AssertionError(f"{case}：最终成功的 CLIENT 不应标记 ERROR")
+    return {
         "span_count": len(spans),
-        "client_count": len(clients),
-        "client_statuses": [a.get("http.response.status_code") for a in attributes],
-        "client_attempts": [a.get("nginx.upstream.attempts") for a in attributes],
-        "client_error_types": [a.get("error.type") for a in attributes],
-        "client_attempt_events": [len([e for e in s.events if e.name == "nginx.upstream.attempt"])
-                                  for s in clients],
+        "client_count": 1,
+        "client_status": attributes.get("http.response.status_code"),
+        "client_attempts": expected_attempts,
+        "attempt_event_statuses": statuses,
+        "parentage": "verified",
     }
-    if not clients:
-        raise AssertionError(f"{case}：未收到任何 CLIENT Span")
-    if any(error_type is not None for error_type in result["client_error_types"]):
-        raise AssertionError(f"{case}：HTTP 最终成功但 CLIENT Span 带有错误类型")
-    if case in ("success", "retry_502"):
-        if 200 not in result["client_statuses"]:
-            raise AssertionError(f"{case}：CLIENT Span 缺少最终 HTTP 200 状态")
-        expected_attempts = 2 if case == "retry_502" else 1
-        if expected_attempts not in result["client_attempts"]:
-            raise AssertionError(f"{case}：CLIENT attempts 未包含 {expected_attempts}")
-        if not any(a == expected_attempts for a in result["client_attempt_events"]):
-            raise AssertionError(f"{case}：CLIENT 真实 attempt 事件数量不正确")
-    else:
-        if not all(status == 200 for status in result["client_statuses"]):
-            raise AssertionError("keepalive：CLIENT Span 存在非 200 状态")
-    return result
 
 
 def run_case(case, nginx, module, output_dir, otel_enabled=False):
     workdir = Path(tempfile.mkdtemp(prefix=f"{case}-", dir=output_dir))
     frontend, backend1, backend2 = ports()
     receiver = TraceReceiver() if otel_enabled else None
-    trace_id = secrets.token_bytes(16) if otel_enabled else None
-    config = config_text(case, frontend, backend1, backend2, module, workdir,
-                         receiver.port if receiver else None)
-    (workdir / "nginx.conf").write_text(config, encoding="utf-8")
-    test_config = subprocess.run(
-        [str(nginx), "-p", str(workdir), "-c", "nginx.conf", "-t"],
-        capture_output=True, text=True, timeout=20,
-    )
-    (workdir / "config-check.txt").write_text(
-        test_config.stdout + "\n" + test_config.stderr, encoding="utf-8"
-    )
-    if test_config.returncode != 0:
+    status, body = None, None
+    traces = []
+    try:
+        config = config_text(case, frontend, backend1, backend2, module, workdir,
+                             receiver.port if receiver else None)
+        (workdir / "nginx.conf").write_text(config, encoding="utf-8")
+        test_config = subprocess.run(
+            [str(nginx), "-p", str(workdir), "-c", "nginx.conf", "-t"],
+            capture_output=True, text=True, timeout=20,
+        )
+        (workdir / "config-check.txt").write_text(
+            test_config.stdout + "\n" + test_config.stderr, encoding="utf-8"
+        )
+        if test_config.returncode != 0:
+            raise RuntimeError(f"配置检查失败：{workdir / 'config-check.txt'}")
+
+        stderr_path = workdir / "process-stderr.log"
+        with stderr_path.open("w", encoding="utf-8") as stderr:
+            proc = subprocess.Popen(
+                [str(nginx), "-p", str(workdir), "-c", "nginx.conf"],
+                stdout=subprocess.DEVNULL, stderr=stderr,
+            )
+            try:
+                wait_for_port(proc, frontend)
+                requests = 2 if case == "keepalive" and otel_enabled else 1
+                responses = []
+                opener = build_opener(ProxyHandler({}))
+                for _ in range(requests):
+                    headers = {}
+                    trace = None
+                    if receiver:
+                        trace_id = secrets.token_bytes(16)
+                        external_parent_id = secrets.token_bytes(8)
+                        headers["traceparent"] = (
+                            f"00-{trace_id.hex()}-{external_parent_id.hex()}-01"
+                        )
+                        trace = (trace_id, external_parent_id)
+                    request = Request(f"http://127.0.0.1:{frontend}/t", headers=headers)
+                    with opener.open(request, timeout=8) as response:
+                        responses.append((response.status,
+                                          response.read().decode("utf-8", errors="replace")))
+                    if trace:
+                        min_spans = 4 if case == "retry_502" else 3
+                        received = receiver.get_trace(trace[0], minimum=min_spans)
+                        traces.append(summarize_trace(received, case, trace[1]))
+                status = responses[-1][0]
+                body = "".join(part for _, part in responses)
+                if any(http_status != 200 for http_status, _ in responses):
+                    raise AssertionError(f"{case}：HTTP 响应码不全为 200：{responses}")
+            except (URLError, OSError) as exc:
+                raise RuntimeError(f"请求失败：{case}：{exc}") from exc
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+    finally:
         if receiver:
             receiver.stop()
-        raise RuntimeError(f"配置检查失败：{workdir / 'config-check.txt'}")
-
-    stderr_path = workdir / "process-stderr.log"
-    with stderr_path.open("w", encoding="utf-8") as stderr:
-        proc = subprocess.Popen(
-            [str(nginx), "-p", str(workdir), "-c", "nginx.conf"],
-            stdout=subprocess.DEVNULL, stderr=stderr,
-        )
-        status, body = None, None
-        try:
-            wait_for_port(proc, frontend)
-            request_headers = {}
-            if trace_id:
-                parent_id = secrets.token_hex(8)
-                request_headers["traceparent"] = f"00-{trace_id.hex()}-{parent_id}-01"
-            request = Request(f"http://127.0.0.1:{frontend}/t",
-                              headers=request_headers)
-            with urlopen(request, timeout=8) as response:
-                status = response.status
-                body = response.read().decode("utf-8", errors="replace")
-            if receiver:
-                spans = receiver.get_trace(trace_id)
-        except (URLError, OSError) as exc:
-            raise RuntimeError(f"请求失败：{case}：{exc}") from exc
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=3)
-            if receiver:
-                receiver.stop()
 
     log_text = (workdir / "error.log").read_text(encoding="utf-8", errors="replace")
-    events = parse_balancer_events(log_text)
     result = {
         "case": case, "status": status, "body": body,
-        "events": events, "log_dir": str(workdir),
+        "events": parse_balancer_events(log_text),
+        "log_dir": str(workdir),
     }
-    if receiver:
-        result["trace"] = summarize_trace(spans, case)
+    if otel_enabled:
+        result["traces"] = traces
     return result
-
 
 def assess(case, actual, expectation):
     """对照上游回归语义，发布原版仅允许显式确认已知冲突。"""
     events = [tuple(x) for x in actual["events"]]
-    expected_body = "200: 1\n200: 2\n" if case == "keepalive" else "ok\n"
+    if case == "keepalive":
+        expected_body = "1\n2\n" if "traces" in actual else "200: 1\n200: 2\n"
+    else:
+        expected_body = "ok\n"
     if actual["status"] != 200 or actual["body"] != expected_body:
         return False, "HTTP 响应或 keepalive 连接复用与预期不符"
 
@@ -347,6 +400,13 @@ def self_test():
     for case in ("success", "keepalive", "retry_502"):
         assert "balancer_by_lua_block" in config_text(
             case, 18080, 18081, 18082, Path("/tmp/mod.so"), Path("/tmp/test"))
+    plain = config_text("keepalive", 18080, 18081, 18082,
+                        Path("/tmp/mod.so"), Path("/tmp/test"))
+    traced = config_text("keepalive", 18080, 18081, 18082,
+                         Path("/tmp/mod.so"), Path("/tmp/test"), 14317)
+    assert 'ngx.location.capture("/proxy")' in plain
+    assert 'ngx.location.capture("/proxy")' not in traced
+    assert 'proxy_pass http://backend;' in traced
     print("通过：日志解析与三个 Lua balancer 配置生成的静态自检")
 
 

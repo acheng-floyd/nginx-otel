@@ -10,6 +10,8 @@ on:
     paths:
       - '.github/workflows/openresty-1.31.8.1-compat.yml'
       - 'compat/openresty-1.31.8.1/**'
+      - 'src/ngx.hpp'
+      - 'CMakeLists.txt'
 
 permissions:
   contents: read
@@ -43,8 +45,11 @@ jobs:
           set -euo pipefail
           git rev-parse HEAD | tee repo-head.txt
           test -f .github/workflows/ubuntu.yml
-          git diff --exit-code -- .github/workflows/ubuntu.yml
-          python3 compat/openresty-1.31.8.1/balancer_notify_probe.py --self-test
+          # 以旧稳定提交的 Git blob SHA 为参照，不只比较当前干净工作树。
+          test "$(git hash-object .github/workflows/ubuntu.yml)" = 579221f72e8e7b944d1cf7abf0f8cddef5a22605
+          test "$(git hash-object src/http_module.cpp)" = 5ed58f1cac7472fde94e0f108992802c25cc3a3d
+          test "$(git hash-object tests/test_otel.py)" = 71e81a6788fe5d9e56bc7340a1701899ada1b21c
+          test "$(git hash-object tests/test_openresty_sg4.py)" = bf14b53e7c890846153b9a430bf4e6bd6d8f9ed3
 
       - name: 安装构建和测试依赖
         run: |
@@ -52,6 +57,14 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake curl jq libc-ares-dev libpcre2-dev \
             iptables libssl-dev perl pkg-config zlib1g-dev
+
+      - name: 验证版本门禁默认拒绝与实验放行逻辑
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compat/openresty-1.31.8.1/test_static_gate.py \
+            | tee version-gate-selftest.txt
+          python3 compat/openresty-1.31.8.1/balancer_notify_probe.py --self-test
 
       - name: 取得官方正式源码并校验固定 SHA256
         shell: bash
@@ -116,7 +129,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "openresty-${OPENRESTY_VERSION}"
-          export NGX_OTEL_CMAKE_OPTS='-DNGX_OTEL_DEV=ON'
+          # 默认版本门禁保持开启；仅本隔离任务显式允许 NGINX 1.31.8。
+          export NGX_OTEL_CMAKE_OPTS='-DNGX_OTEL_DEV=ON -DNGX_OTEL_OPENRESTY_13181_LAB=ON'
           ./configure -j2 \
             --prefix="${OPENRESTY_PREFIX}" \
             --with-compat \
@@ -124,9 +138,14 @@ jobs:
             --with-http_ssl_module \
             --with-http_v2_module \
             --with-http_v3_module \
-            --add-dynamic-module="${GITHUB_WORKSPACE}"
-          make -j2
-          make install
+            --add-dynamic-module="${GITHUB_WORKSPACE}" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/openresty-configure.log"
+          # 确认实验宏只注入 OTel 动态模块编译，不传播至依赖库。
+          flags=build/nginx-1.31.8/objs/otel/CMakeFiles/ngx_otel_module.dir/flags.make
+          test -f "${flags}"
+          grep -Fq -- '-DNGX_OTEL_OPENRESTY_13181_LAB=1' "${flags}"
+          make -j2 2>&1 | tee "${GITHUB_WORKSPACE}/openresty-build.log"
+          make install 2>&1 | tee "${GITHUB_WORKSPACE}/openresty-install.log"
           nginx="${OPENRESTY_PREFIX}/nginx/sbin/nginx"
           module="$(find build -type f -name ngx_otel_module.so -print -quit)"
           luajit="${OPENRESTY_PREFIX}/luajit/lib"
@@ -169,6 +188,12 @@ jobs:
 
       - name: 安装隔离实验与原有 pytest 所需 Python 依赖
         run: pip install -r tests/requirements.txt
+
+      - name: 运行严格探针单元测试（合成数据不代替真实 Span）
+        run: |
+          python3 -m unittest discover \
+            -s compat/openresty-1.31.8.1 \
+            -p test_probe_logic.py -v
 
       - name: 运行最小 Lua balancer #1154 现场复现/修复对照
         id: bare_probe
@@ -236,7 +261,7 @@ jobs:
       - name: 精确校验 6 项专项测试全部通过
         id: qualification_count
         continue-on-error: true
-        if: ${{ always() && matrix.variant == 'release' }}
+        if: ${{ always() && matrix.variant == 'release' && steps.qualification.outcome != 'skipped' }}
         run: |
           python3 compat/openresty-1.31.8.1/check_junit.py \
             pytest-openresty-qualification.xml 6
@@ -257,7 +282,7 @@ jobs:
       - name: 精确校验 56 项无失败/错误/跳过
         id: regression_count
         continue-on-error: true
-        if: ${{ always() && matrix.variant == 'release' }}
+        if: ${{ always() && matrix.variant == 'release' && steps.regression.outcome != 'skipped' }}
         run: |
           python3 compat/openresty-1.31.8.1/check_junit.py \
             pytest-openresty.xml 56
@@ -275,6 +300,8 @@ jobs:
             echo "- 源代码分支：${GITHUB_REF_NAME}"
             echo "- 当前矩阵：${{ matrix.variant }}"
             echo '- 验证对象：正式版原始源码 vs. 单常量修复实验副本'
+            echo '- 实验开关：NGX_OTEL_OPENRESTY_13181_LAB（仅 OTel 动态模块）'
+            echo '- 本工作流禁止生成生产可发布制品；不改变原有编译门禁的默认值。'
             if [ '${{ matrix.variant }}' = 'release' ]; then
               echo '- **生产升级状态：禁止放行。#1154 源码冲突已知，必须结合测试结果及正式上游修复重新评估。**'
               echo '- 旧版的 ubuntu.yml 门禁完全未修改。'
@@ -314,7 +341,11 @@ jobs:
           if-no-files-found: warn
           path: |
             repo-head.txt
+            version-gate-selftest.txt
             openresty-source.sha256
+            openresty-configure.log
+            openresty-build.log
+            openresty-install.log
             openresty-version.txt
             openresty-runtime-ldd.txt
             module-runtime-ldd.txt
