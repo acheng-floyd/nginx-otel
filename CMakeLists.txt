@@ -12,6 +12,13 @@ set(NGX_OTEL_SDK  11d5d9e0d8fd8ba876c8994714cc2647479b6574 # v1.11.0
     CACHE STRING "OTel SDK tag to download or 'package' to use preinstalled")
 set(NGX_OTEL_PROTO_DIR  ""  CACHE PATH "OTel proto files root")
 set(NGX_OTEL_DEV        OFF CACHE BOOL "Enforce compiler warnings")
+option(NGX_OTEL_OPENRESTY_13181_LAB
+    "EXPERIMENT ONLY: allow NGINX 1.31.8 for isolated OpenResty 1.31.8.1 tests"
+    OFF)
+if(NGX_OTEL_OPENRESTY_13181_LAB AND NOT NGX_OTEL_DEV)
+    message(FATAL_ERROR
+        "NGX_OTEL_OPENRESTY_13181_LAB requires NGX_OTEL_DEV=ON (CI-only)")
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -133,6 +140,11 @@ add_library(ngx_otel_module MODULE
 
 # avoid 'lib' prefix in binary name
 set_target_properties(ngx_otel_module PROPERTIES PREFIX "")
+# 仅为指定目标注入实验标记，避免向 gRPC/OTel 依赖或正式构建传播。
+if(NGX_OTEL_OPENRESTY_13181_LAB)
+    target_compile_definitions(ngx_otel_module PRIVATE
+        NGX_OTEL_OPENRESTY_13181_LAB=1)
+endif()
 
 # can't use OTel's WITH_ABSEIL until cmake 3.24, as it triggers find_package()
 target_compile_definitions(ngx_otel_module PRIVATE HAVE_ABSEIL)
