@@ -1,0 +1,325 @@
+# SPDX-License-Identifier: Apache-2.0
+# SG5.1 独立兼容性实验，不修改 ubuntu.yml，也不对 main / pull_request 触发。
+name: SG5.1 OpenResty 1.31.8.1 隔离验证
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'compat/openresty-1.31.8.1-*'
+    paths:
+      - '.github/workflows/openresty-1.31.8.1-compat.yml'
+      - 'compat/openresty-1.31.8.1/**'
+
+permissions:
+  contents: read
+
+env:
+  OPENRESTY_VERSION: '1.31.8.1'
+  # 固定公开归档的 SHA256，禁止通过仅验证文件名的方式安装。
+  OPENRESTY_SHA256: 'b569c63b420f80a4ac8466f2deffe73ed93ab760026532e039c3658409a997f4'
+  OTELCOL_VERSION: '0.159.0'
+
+jobs:
+  openresty-compat:
+    name: '1.31.8.1 / ${{ matrix.variant }}'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [release, upstream-fix-lab]
+    env:
+      OPENRESTY_PREFIX: '${{ github.workspace }}/openresty-install-${{ matrix.variant }}'
+    steps:
+      - name: 检出当前隔离分支（不写入仓库）
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: 验证仓库 HEAD 和独立工作流边界
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee repo-head.txt
+          test -f .github/workflows/ubuntu.yml
+          git diff --exit-code -- .github/workflows/ubuntu.yml
+          python3 compat/openresty-1.31.8.1/balancer_notify_probe.py --self-test
+
+      - name: 安装构建和测试依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake curl jq libc-ares-dev libpcre2-dev \
+            iptables libssl-dev perl pkg-config zlib1g-dev
+
+      - name: 取得官方正式源码并校验固定 SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="openresty-${OPENRESTY_VERSION}.tar.gz"
+          curl --fail --show-error --location --retry 3 \
+            -o "${archive}" "https://openresty.org/download/${archive}"
+          printf '%s  %s\n' "${OPENRESTY_SHA256}" "${archive}" | sha256sum -c -
+          sha256sum "${archive}" | tee openresty-source.sha256
+          tar -xzf "${archive}"
+          test -f "openresty-${OPENRESTY_VERSION}/bundle/nginx-1.31.8/src/http/ngx_http_upstream.h"
+          grep -Eq '^#define NGINX_VERSION +"1\.31\.8"' \
+            "openresty-${OPENRESTY_VERSION}/bundle/nginx-1.31.8/src/core/nginx.h"
+          echo '通过：下载源码 SHA256 与 NGINX 1.31.8 核心版本匹配'
+
+      - name: 审计发布源码中的通知常量冲突
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source-audit
+          header="openresty-${OPENRESTY_VERSION}/bundle/nginx-1.31.8/src/http/ngx_http_upstream.h"
+          grep -Fxc '#define NGX_HTTP_UPSTREAM_NOTIFY_CACHED_CONNECTION_ERROR 0x1' "${header}" | grep -qx 1
+          grep -Fxc '#define NGX_HTTP_UPSTREAM_NOTIFY_HEADER      0x1' "${header}" | grep -qx 1
+          cp "${header}" source-audit/upstream-release-header.h
+          grep 'NGX_HTTP_UPSTREAM_NOTIFY_' "${header}" | tee source-audit/release-notify.txt
+          echo '确认：正式发布源码中的两个通知值均为 0x1；已识别 #1154 风险'
+
+      - name: 仅在对照副本中应用上游 0x80 修复语义
+        if: ${{ matrix.variant == 'upstream-fix-lab' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          p = Path('openresty-1.31.8.1/bundle/nginx-1.31.8/src/http/ngx_http_upstream.h')
+          raw = p.read_bytes()
+          old = b'#define NGX_HTTP_UPSTREAM_NOTIFY_CACHED_CONNECTION_ERROR 0x1'
+          new = b'#define NGX_HTTP_UPSTREAM_NOTIFY_CACHED_CONNECTION_ERROR 0x80'
+          assert raw.count(old) == 1, '不符合上游补丁的唯一匹配前置条件'
+          assert raw.count(new) == 0, '原始源码不应已包含目标修复'
+          p.write_bytes(raw.replace(old, new))
+          print('通过：隔离源码副本仅替换一个通知常量的 0x1 -> 0x80')
+          PYFIX
+          diff -u source-audit/upstream-release-header.h \
+            "openresty-${OPENRESTY_VERSION}/bundle/nginx-1.31.8/src/http/ngx_http_upstream.h" \
+            > source-audit/upstream-fix-lab.diff || test "$?" -eq 1
+          test "$(grep -c '^[-+]#define NGX_HTTP_UPSTREAM_NOTIFY_CACHED_CONNECTION_ERROR' source-audit/upstream-fix-lab.diff)" -eq 2
+          cat source-audit/upstream-fix-lab.diff
+          echo '注意：对照修复只修改 CI 临时解压副本，不代表官方正式版本已修复'
+
+      - name: 记录当前 NGINX 核心源码快照
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "openresty-${OPENRESTY_VERSION}/bundle/nginx-1.31.8" -type f -print0 \
+            | sort -z | xargs -0 sha256sum | sha256sum \
+            > source-audit/nginx-core.before.sha256
+
+      - name: 构建并隔离安装 OpenResty + SG5.1 动态模块
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "openresty-${OPENRESTY_VERSION}"
+          export NGX_OTEL_CMAKE_OPTS='-DNGX_OTEL_DEV=ON'
+          ./configure -j2 \
+            --prefix="${OPENRESTY_PREFIX}" \
+            --with-compat \
+            --with-debug \
+            --with-http_ssl_module \
+            --with-http_v2_module \
+            --with-http_v3_module \
+            --add-dynamic-module="${GITHUB_WORKSPACE}"
+          make -j2
+          make install
+          nginx="${OPENRESTY_PREFIX}/nginx/sbin/nginx"
+          module="$(find build -type f -name ngx_otel_module.so -print -quit)"
+          luajit="${OPENRESTY_PREFIX}/luajit/lib"
+          test -x "${nginx}"
+          test -n "${module}" && test -f "${module}"
+          test -e "${luajit}/libluajit-5.1.so.2"
+          {
+            echo "OPENRESTY_NGINX=${nginx}"
+            echo "OPENRESTY_MODULE=${PWD}/${module}"
+            echo "LUAJIT_LIB_DIR=${luajit}"
+            echo "LD_LIBRARY_PATH=${luajit}:${LD_LIBRARY_PATH:-}"
+          } >> "${GITHUB_ENV}"
+
+      - name: 审计二进制身份、模块加载前置条件及动态库
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${OPENRESTY_NGINX}" -V 2>&1 | tee openresty-version.txt
+          grep -Fq 'openresty/1.31.8.1' openresty-version.txt
+          grep -Fq 'nginx/1.31.8' openresty-version.txt || \
+            echo '说明：-V 显示 OpenResty 版本，内核版本已由 nginx.h 检查'
+          grep -Fq -- '--with-compat' openresty-version.txt
+          grep -Fq -- '--with-debug' openresty-version.txt
+          ldd "${OPENRESTY_NGINX}" | tee openresty-runtime-ldd.txt
+          ! grep -Fq 'not found' openresty-runtime-ldd.txt
+          grep -Fq 'libluajit-5.1.so.2' openresty-runtime-ldd.txt
+          ldd "${OPENRESTY_MODULE}" | tee module-runtime-ldd.txt
+          ! grep -Fq 'not found' module-runtime-ldd.txt
+          echo '通过：主程序及动态模块无缺失运行库；后续 nginx -t 实测动态模块 ABI'
+
+      - name: 确认构建未悄悄更改 NGINX 核心源码
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "openresty-${OPENRESTY_VERSION}/bundle/nginx-1.31.8" -type f -print0 \
+            | sort -z | xargs -0 sha256sum | sha256sum \
+            > source-audit/nginx-core.after.sha256
+          cmp source-audit/nginx-core.before.sha256 source-audit/nginx-core.after.sha256
+          echo '通过：编译前后核心源码快照相同（实验补丁在编译前单独记录）'
+
+      - name: 安装隔离实验与原有 pytest 所需 Python 依赖
+        run: pip install -r tests/requirements.txt
+
+      - name: 运行最小 Lua balancer #1154 现场复现/修复对照
+        id: bare_probe
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          expected='release'
+          if [ '${{ matrix.variant }}' = 'upstream-fix-lab' ]; then
+            expected='fixed'
+          fi
+          python3 compat/openresty-1.31.8.1/balancer_notify_probe.py \
+            --nginx "${OPENRESTY_NGINX}" \
+            --module "${OPENRESTY_MODULE}" \
+            --expect "${expected}" \
+            --output-dir "${GITHUB_WORKSPACE}/probe-report"
+
+      - name: 验证 Lua balancer 启用 SG5.1 OTel 后的真实 CLIENT Span
+        id: otel_probe
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          expected='release'
+          if [ '${{ matrix.variant }}' = 'upstream-fix-lab' ]; then
+            expected='fixed'
+          fi
+          python3 compat/openresty-1.31.8.1/balancer_notify_probe.py \
+            --nginx "${OPENRESTY_NGINX}" \
+            --module "${OPENRESTY_MODULE}" \
+            --expect "${expected}" \
+            --otel-check \
+            --output-dir "${GITHUB_WORKSPACE}/probe-otel-report"
+
+      - name: 下载并校验固定版本的 OTel Collector
+        if: ${{ matrix.variant == 'release' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}"
+          archive="otelcol_${OTELCOL_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLO "${base}/${archive}"
+          curl -fsSLo "${archive}.sha256" "${base}/${archive}.sha256"
+          expected="$(tr -d '[:space:]' < "${archive}.sha256")"
+          printf '%s  %s\n' "${expected}" "${archive}" | sha256sum -c -
+          tar -xzf "${archive}"
+
+      - name: 安装原有 SG5.1 确定性连接超时故障
+        if: ${{ matrix.variant == 'release' }}
+        run: sudo iptables -I OUTPUT 1 -p tcp -d 127.0.0.1 --dport 18087 -j DROP
+
+      - name: 单独复跑全部 6 项 OpenResty 专项回归
+        id: qualification
+        continue-on-error: true
+        if: ${{ matrix.variant == 'release' }}
+        env:
+          NGX_OTEL_OPENRESTY_TESTS: '1'
+        run: |
+          pytest tests/test_openresty_sg4.py -vv --maxfail=6 \
+            --junitxml=pytest-openresty-qualification.xml \
+            --nginx="${OPENRESTY_NGINX}" \
+            --module="${OPENRESTY_MODULE}" \
+            --otelcol=./otelcol
+
+      - name: 精确校验 6 项专项测试全部通过
+        id: qualification_count
+        continue-on-error: true
+        if: ${{ always() && matrix.variant == 'release' }}
+        run: |
+          python3 compat/openresty-1.31.8.1/check_junit.py \
+            pytest-openresty-qualification.xml 6
+
+      - name: 复跑 SG5.1 的完整 56 项 OpenResty 回归
+        id: regression
+        continue-on-error: true
+        if: ${{ matrix.variant == 'release' }}
+        env:
+          NGX_OTEL_OPENRESTY_TESTS: '1'
+          NGX_OTEL_SG5_CONNECT_TIMEOUT: '1'
+        run: |
+          pytest tests -vv --junitxml=pytest-openresty.xml \
+            --nginx="${OPENRESTY_NGINX}" \
+            --module="${OPENRESTY_MODULE}" \
+            --otelcol=./otelcol
+
+      - name: 精确校验 56 项无失败/错误/跳过
+        id: regression_count
+        continue-on-error: true
+        if: ${{ always() && matrix.variant == 'release' }}
+        run: |
+          python3 compat/openresty-1.31.8.1/check_junit.py \
+            pytest-openresty.xml 56
+
+      - name: 清理仅测试期间注入的网络故障
+        if: ${{ always() && matrix.variant == 'release' }}
+        run: sudo iptables -D OUTPUT -p tcp -d 127.0.0.1 --dport 18087 -j DROP || true
+
+      - name: 写入审计摘要并明确生产升级门禁
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo '## SG5.1 / OpenResty 1.31.8.1 隔离验证'
+            echo "- 源代码分支：${GITHUB_REF_NAME}"
+            echo "- 当前矩阵：${{ matrix.variant }}"
+            echo '- 验证对象：正式版原始源码 vs. 单常量修复实验副本'
+            if [ '${{ matrix.variant }}' = 'release' ]; then
+              echo '- **生产升级状态：禁止放行。#1154 源码冲突已知，必须结合测试结果及正式上游修复重新评估。**'
+              echo '- 旧版的 ubuntu.yml 门禁完全未修改。'
+            else
+              echo '- **实验副本：仅作上游 0x80 变更对照，不是可发布软件。**'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: 统一检查实验与 6/56 回归门禁（禁止软失败）
+        if: ${{ always() }}
+        shell: bash
+        env:
+          BARE_RESULT: ${{ steps.bare_probe.outcome }}
+          OTEL_RESULT: ${{ steps.otel_probe.outcome }}
+          QUAL_RESULT: ${{ steps.qualification.outcome }}
+          QUAL_COUNT_RESULT: ${{ steps.qualification_count.outcome }}
+          REGRESSION_RESULT: ${{ steps.regression.outcome }}
+          REGRESSION_COUNT_RESULT: ${{ steps.regression_count.outcome }}
+        run: |
+          set -euo pipefail
+          test "${BARE_RESULT}" = success
+          test "${OTEL_RESULT}" = success
+          if [ '${{ matrix.variant }}' = 'release' ]; then
+            test "${QUAL_RESULT}" = success
+            test "${QUAL_COUNT_RESULT}" = success
+            test "${REGRESSION_RESULT}" = success
+            test "${REGRESSION_COUNT_RESULT}" = success
+          fi
+          echo '通过：全部必需专项实验、OTel 验证与正式版 6/56 回归门禁'
+
+      - name: 无论成功或失败均上传复现证据
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'sg51-openresty-13181-${{ matrix.variant }}'
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            repo-head.txt
+            openresty-source.sha256
+            openresty-version.txt
+            openresty-runtime-ldd.txt
+            module-runtime-ldd.txt
+            source-audit/
+            probe-report/
+            probe-otel-report/
+            pytest-openresty.xml
+            pytest-openresty-qualification.xml
